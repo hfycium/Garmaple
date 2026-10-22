@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "garmaple"
+version = "0.1.0"
+description = "Local-first analysis of your Garmin export archive, exposed to AI via MCP"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "hfycium" }]
+keywords = ["garmin", "fit", "mcp", "health", "running"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+dependencies = [
+    "fitdecode>=0.10.0",
+    "mcp>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://github.com/hfycium/Garmaple"
+
+[project.scripts]
+garmaple = "garmaple.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["garmaple*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
