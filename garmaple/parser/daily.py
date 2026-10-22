@@ -137,6 +137,9 @@ class DailyStat:
     bb_end: int | None = None
     bb_high_at: datetime | None = None
     bb_low_at: datetime | None = None
+    # --- 当日时区偏移 ---
+    # 睡眠数据里只有 GMT 时间戳、没有本地字段，要靠这里借偏移才能换算钟面时刻
+    utc_offset_hours: float | None = None
     # --- 敏感字段：由 privacy 层决定是否输出 ---
     user_profile_id: int | None = None
 
@@ -245,6 +248,7 @@ def parse_daily(raw: Any, fallback_offset: float = 0.0) -> DailyStat | None:
         bb_end=bb_value("ENDOFDAY"),
         bb_high_at=bb_time("HIGHEST"),
         bb_low_at=bb_time("LOWEST"),
+        utc_offset_hours=round(offset / 3600.0, 4),
         user_profile_id=_int(raw.get("userProfilePK")),
     )
 

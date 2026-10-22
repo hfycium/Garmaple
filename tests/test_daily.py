@@ -307,3 +307,22 @@ def test_parse_daily_without_fallback_uses_local_metadata() -> None:
     d = parse_daily(broken)
     assert d is not None
     assert d.bb_high_at == datetime(2026, 7, 24, 2, 57)  # 偏移按 0 处理
+
+
+# ---------- 时区偏移对外暴露 ----------
+
+def test_utc_offset_hours_is_exposed() -> None:
+    """睡眠数据只有 GMT 时间戳，要靠这里借偏移换算钟面时刻。"""
+    d = parse_daily(make_block())
+    assert d is not None
+    assert d.utc_offset_hours == 8.0
+
+
+def test_utc_offset_borrows_fallback_when_metadata_is_broken() -> None:
+    broken = make_block(
+        wellnessStartTimeGmt="2026-07-24T00:01:00.0",
+        wellnessStartTimeLocal="2026-07-24T00:00:00.0",
+    )
+    d = parse_daily(broken, fallback_offset=8 * 3600)
+    assert d is not None
+    assert d.utc_offset_hours == 8.0
