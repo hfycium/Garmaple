@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .parser.activities import Activity
+from .parser.daily import DailyStat
 
 # 固定盐值：让伪 ID 在多次会话间保持稳定，又不直接暴露 activityId
 _ID_SALT = "garmaple-v1"
@@ -64,6 +65,11 @@ class Privacy:
     def allows_raw_id(self) -> bool:
         return self.level != "strict"
 
+    @property
+    def allows_identity(self) -> bool:
+        """账号与设备标识（userProfilePK 等）只在 raw 下返回。"""
+        return self.level == "raw"
+
     # ---------- 转换 ----------
 
     def public_id(self, activity_id: int) -> str:
@@ -84,6 +90,16 @@ class Privacy:
         if self.allows_precise_time:
             return dt.replace(tzinfo=None).isoformat(sep=" ", timespec="seconds")
         return dt.date().isoformat()
+
+    def clock(self, dt: datetime | None) -> str | None:
+        """日汇总里的「几点几分」：strict 下一律不给。
+
+        身体电量的峰值时刻会暴露作息（几点起床、几点最累），
+        和精确开始时间是同一类信息，因此与 `allows_precise_time` 同档处理。
+        """
+        if dt is None or not self.allows_precise_time:
+            return None
+        return dt.strftime("%H:%M")
 
     def _safe_name(self, act: Activity) -> str | None:
         """strict/normal 下剥离活动名称里的地点。
@@ -156,5 +172,49 @@ class Privacy:
                     "user_profile_id": act.user_profile_id,
                 }
             )
+
+        return self._strip_none(out)
+
+    def day(self, d: DailyStat) -> dict[str, object]:
+        """单日 wellness 汇总。
+
+        strict 下只丢「时刻」，不丢数值——步数、静息心率、压力、身体电量
+        都是聚合量，不含位置与身份信息，分析本身需要它们。
+        """
+        out: dict[str, object] = {
+            "date": d.date,
+            "steps": d.steps,
+            "step_goal": d.step_goal,
+            "distance_km": d.distance_km,
+            "intensity_minutes": d.intensity_minutes,
+            "intensity_goal": d.intensity_goal_min,
+            "moderate_min": d.moderate_min,
+            "vigorous_min": d.vigorous_min,
+            "resting_hr": d.resting_hr,
+            "hr_min": d.min_hr,
+            "hr_max": d.max_hr,
+            "calories_total": (
+                round(d.calories_total) if d.calories_total is not None else None
+            ),
+            "calories_active": (
+                round(d.calories_active) if d.calories_active is not None else None
+            ),
+            "stress_avg": d.stress_avg,
+            "stress_max": d.stress_max,
+            "stress_off_wrist_min": d.stress_off_wrist_min,
+            "stress_rest_s": d.stress_rest_s,
+            "stress_high_s": d.stress_high_s,
+            "bb_charged": d.bb_charged,
+            "bb_drained": d.bb_drained,
+            "bb_high": d.bb_high,
+            "bb_low": d.bb_low,
+            "bb_start": d.bb_start,
+            "bb_end": d.bb_end,
+            "bb_high_at": self.clock(d.bb_high_at),
+            "bb_low_at": self.clock(d.bb_low_at),
+        }
+
+        if self.allows_identity:
+            out["user_profile_id"] = d.user_profile_id
 
         return self._strip_none(out)

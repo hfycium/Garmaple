@@ -8,14 +8,17 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 import pytest
 
 from garmaple.parser.activities import parse_activity
+from garmaple.parser.daily import parse_daily
 from garmaple.privacy import Privacy
 
 from .test_activities import make_raw
+from .test_daily import make_block
 
 
 def make_activity(**overrides: object):
@@ -169,3 +172,62 @@ def test_training_effect_is_rounded() -> None:
     """原始值形如 0.10000000149011612，直接返回会污染上下文。"""
     out = Privacy("strict").activity(make_activity(anaerobicTrainingEffect=0.10000000149011612))
     assert out["anaerobic_te"] == 0.1
+
+
+# ---------- 每日汇总 ----------
+
+
+def make_day(**overrides: object):
+    day = parse_daily(make_block(**overrides))
+    assert day is not None
+    return day
+
+
+@pytest.mark.parametrize("level", ["strict", "normal", "raw"])
+def test_day_keeps_aggregates_at_every_level(level: str) -> None:
+    out = Privacy(level).day(make_day())
+    assert out["date"] == "2026-07-24"
+    assert out["steps"] == 9523
+    assert out["resting_hr"] == 48
+    assert out["stress_avg"] == 33
+    assert out["bb_high"] == 75
+    assert out["intensity_minutes"] == 30 + 2 * 18
+
+
+def test_day_strict_drops_clock_times() -> None:
+    """身体电量峰值时刻会暴露作息，strict 下不给。"""
+    out = Privacy("strict").day(make_day())
+    assert "bb_high_at" not in out
+    assert "bb_low_at" not in out
+    assert not re.search(r"\d{2}:\d{2}", repr(out))
+
+
+def test_day_normal_gives_hh_mm() -> None:
+    out = Privacy("normal").day(make_day())
+    assert out["bb_high_at"] == "10:57"
+    assert out["bb_low_at"] == "00:01"
+
+
+def test_day_user_profile_only_in_raw() -> None:
+    assert "user_profile_id" not in Privacy("strict").day(make_day())
+    assert "user_profile_id" not in Privacy("normal").day(make_day())
+    assert Privacy("raw").day(make_day())["user_profile_id"] == 999
+
+
+def test_day_drops_missing_fields() -> None:
+    block = make_block()
+    del block["bodyBattery"]
+    day = parse_daily(block)
+    assert day is not None
+    out = Privacy("strict").day(day)
+    assert "bb_high" not in out
+    assert "stress_avg" in out
+
+
+def test_day_calories_are_rounded() -> None:
+    out = Privacy("strict").day(make_day(totalKilocalories=2748.4))
+    assert out["calories_total"] == 2748
+
+
+def test_clock_returns_none_for_missing_time() -> None:
+    assert Privacy("raw").clock(None) is None
