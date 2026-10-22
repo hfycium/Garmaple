@@ -39,6 +39,101 @@ def human_pace(seconds_per_km: float | None) -> str | None:
     return f"{m}'{s:02d}\"/km"
 
 
+# 低于这个速度就当作「停下了」。0.3 m/s 约 1.1 km/h，比正常步行（1.1~1.5 m/s）
+# 慢得多；用它兜住设备在原地记录的 0 速度与漂移，免得算出 9999"/km 这种配速。
+STANDSTILL_MPS = 0.3
+
+
+def pace_from_speed(speed_mps: float | None) -> int | None:
+    """瞬时速度换成秒每公里。停下时返回 None，不要给一个巨大的配速。
+
+    逐秒序列里静止点很常见（等红灯、拍照、暂停），如果照 `1000 / speed`
+    算，0.01 m/s 会得到 100000"/km，画出来的配速曲线会被这些点压平。
+    """
+    if speed_mps is None or speed_mps < STANDSTILL_MPS:
+        return None
+    return int(round(1000.0 / speed_mps))
+
+
+# 有氧解耦（配速心率漂移）的最小可用时长。20 分钟以下前后半程各只剩
+# 十来分钟，热身还没走完，算出来的「漂移」主要是热身带来的自然上升。
+DECOUPLING_MIN_SECONDS = 1200
+
+# 每一半至少要有这么多个有效采样，否则平均值的抖动会盖过真实漂移
+DECOUPLING_MIN_POINTS = 30
+
+
+def pace_hr_drift(samples: Iterable[Any]) -> dict[str, Any]:
+    """前后半程的「速度 ÷ 心率」比值变化，也就是有氧解耦。
+
+    口径：
+
+    - 比值取`平均速度 / 平均心率`（m/s per bpm）。同样心率跑得更快，比值就
+      更高，所以**比值下降 = 效率下降**。
+    - `drift_pct` 取正数表示后半程效率下降（心率漂移），与跑步圈说的
+      「解耦 5%」同向：同样配速下心率涨了，或者同样心率下配速掉了。
+    - 只用同时有速度与心率的采样点。静止点不参与平均，否则一次等红灯就能
+      把前半程的平均速度拉下去，凭空造出一个「漂移」。
+    - 没有心率的活动（力量训练之类）直接返回 `available=False`。
+
+    `reliable` **只表示样本条件够不够**（时长与点数），不代表结论成立：
+    前半程冲、后半程放松同样会让比值变化，但那不是心率漂移。工具没法从
+    数据里区分这两件事，只能在说明里讲清楚看到的是什么。
+    """
+    usable = [
+        s
+        for s in samples
+        if getattr(s, "hr", None)
+        and s.hr > 0
+        and getattr(s, "speed_mps", None) is not None
+        and s.speed_mps >= STANDSTILL_MPS
+    ]
+    if not usable:
+        return {"available": False, "reason": "no_hr_or_speed"}
+
+    first_ts = usable[0].offset_s
+    last_ts = usable[-1].offset_s
+    span = last_ts - first_ts
+    if span <= 0:
+        return {"available": False, "reason": "too_short"}
+
+    mid = first_ts + span / 2
+    first_half = [s for s in usable if s.offset_s <= mid]
+    second_half = [s for s in usable if s.offset_s > mid]
+
+    if len(first_half) < DECOUPLING_MIN_POINTS or len(second_half) < DECOUPLING_MIN_POINTS:
+        return {
+            "available": False,
+            "reason": "too_few_points",
+            "points": len(usable),
+            "needed": DECOUPLING_MIN_POINTS * 2,
+        }
+
+    def half(points: list[Any]) -> dict[str, Any]:
+        speed = sum(s.speed_mps for s in points) / len(points)
+        hr = sum(s.hr for s in points) / len(points)
+        return {
+            "points": len(points),
+            "avg_speed_mps": round(speed, 3),
+            "avg_hr": round(hr, 1),
+            "efficiency": round(speed / hr, 5),
+            "avg_pace_s_per_km": round(1000.0 / speed) if speed else None,
+        }
+
+    a = half(first_half)
+    b = half(second_half)
+    drift = (a["efficiency"] - b["efficiency"]) / a["efficiency"] * 100
+
+    return {
+        "available": True,
+        "first_half": a,
+        "second_half": b,
+        "drift_pct": round(drift, 1),
+        "span_s": round(span),
+        "reliable": span >= DECOUPLING_MIN_SECONDS,
+    }
+
+
 def _get(row: Mapping[str, Any] | Any, key: str) -> Any:
     """兼容 sqlite3.Row 与 dict。"""
     try:

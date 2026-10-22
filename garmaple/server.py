@@ -10,11 +10,20 @@ from collections import Counter
 from datetime import date
 from typing import Any
 
+from .archive import ArchiveError, discover
 from .config import Config
+from .parser.fit import downsample, sample_summary
 from .parser.metrics import RACE_DISTANCES_KM
 from .parser.records import GROUPS, GearUsage
 from .privacy import Privacy
-from .stats import human_duration, human_pace, summarize, zone_summary
+from .stats import (
+    human_duration,
+    human_pace,
+    pace_hr_drift,
+    summarize,
+    zone_summary,
+)
+from .streams import find_stream
 from .store import (
     Store,
     row_to_activity,
@@ -41,15 +50,21 @@ INSTRUCTIONS = """\
 当前索引包含：活动摘要（含心率区间累计时长）、每日 wellness 汇总（步数、
 静息心率、压力、身体电量、强度分钟）、睡眠（时长与分期）、训练状态（状态
 判定、周训练负荷、负荷隧道）、比赛成绩预测（5K / 10K / 半马 / 全马）、
-最大摄氧量、个人最佳纪录、装备里程。
+最大摄氧量、个人最佳纪录、装备里程、以及从原始 .fit 解析出的逐秒曲线
+（心率、配速、海拔、步频；覆盖大部分活动但不是全部）。
 
 七点必须注意：
 - 睡眠记录按**醒来日**归档。问「昨晚睡得怎么样」要查今天那条，
   查昨天会拿到前一晚的数据。
-- 官方导出包里没有睡眠评分数值，也没有 CTL / ATL / TSB 三个体能指标，
-  也没有逐秒采样。训练状态与周训练负荷是设备自己判定的结果，
+- 官方导出包里没有睡眠评分数值，也没有 CTL / ATL / TSB 三个体能指标。
+  训练状态与周训练负荷是设备自己判定的结果，
   与 Connect 上显示的一致，但不要把它当成 CTL 用，也不要自行换算。
   被问到时直接说明当前没有这项能力，不要猜测或估算数值。
+- 逐秒曲线是真实采样，不是插值。但它**只覆盖有 .fit 文件的活动**，
+  查不到时不要下结论说「那次没记录心率」——先看 get_activity 的汇总值。
+  曲线返回的 `series` 是抽稀后的（默认 300 点），极值以 `summary` 为准。
+  配速心率漂移只在稳态有氧上成立，间歇跑与冲刺本来前后就该不一样，
+  不要拿它评价这类训练。
 - 比赛预测是设备按当前体能**推算**的完赛时间，不是已经跑出来的成绩；
   个人最佳里的 5K / 10K / 半马纪录才是实际达成的。两者不要混着说。
 - 最大摄氧量只在设备测出有效数据的日子才有记录，日期很稀疏，
@@ -145,6 +160,14 @@ def build_server(cfg: Config) -> Any:
                     "days": day_count,
                     "date_from": dlo,
                     "date_to": dhi,
+                }
+            # 逐秒曲线只覆盖有 .fit 文件的活动，先在这里报出覆盖量，
+            # 免得模型以为每次活动都能画曲线
+            fit_count = store.count_fit_files()
+            if fit_count:
+                result["activity_streams"] = {
+                    "activities_with_streams": fit_count,
+                    "note": "逐秒心率 / 配速 / 海拔 / 步频，用 get_activity_streams 取",
                 }
             sleep_count = store.count_sleeps()
             if sleep_count:
@@ -242,6 +265,166 @@ def build_server(cfg: Config) -> Any:
                     "hint": "请先用 list_activities 获取有效 ID",
                 }
             return privacy.activity(row_to_activity(row))
+
+    def _activity_stream(store: Store, act: Any) -> tuple[Any, str | None]:
+        """按活动取逐秒数据，返回 `(stream, 失败原因)`。
+
+        失败原因分四种，各自的应对方式不一样，所以不在这里统一报错——由调用
+        方决定是说「重跑 index」「这次活动没有 FIT」还是「换个工具」。
+        """
+        if not store.count_fit_files():
+            return None, "no_fit_index"
+        if act.utc_start is None:
+            return None, "no_start_time"
+        try:
+            data_dir = cfg.require_data()
+        except Exception as exc:  # ConfigError：数据目录不可用
+            raise ToolError(
+                f"逐秒数据需要读原始 .fit 文件，但数据目录不可用：{exc}"
+            ) from exc
+        try:
+            with discover(data_dir) as dataset:
+                stream = find_stream(
+                    dataset, act.utc_start.isoformat(), act.duration_s, store=store
+                )
+        except ArchiveError as exc:
+            raise ToolError(f"读取归档失败：{exc}") from exc
+        return stream, (None if stream is not None else "not_found")
+
+    def _no_stream_response(activity_id: str, reason: str | None) -> dict[str, Any]:
+        """逐秒数据取不到时给模型看的话。"""
+        if reason == "no_fit_index":
+            hint = (
+                "索引里没有逐秒记录。归档缺少内嵌的 .fit 文件，"
+                "或索引版本过旧——重跑一次 `garmaple index` 即可"
+            )
+        elif reason == "no_start_time":
+            hint = "该活动没有开始时间，无法与 FIT 文件对齐"
+        else:
+            hint = (
+                "这次活动在归档里没有对应的 FIT 文件。导出包里不是每次活动"
+                "都带逐秒记录（例如手动添加的记录），可以改用 get_activity "
+                "看整段汇总值"
+            )
+        return {"available": False, "activity_id": activity_id, "hint": hint}
+
+    @mcp.tool()
+    def get_activity_streams(activity_id: str, max_points: int = 300) -> dict[str, Any]:
+        """单次活动的逐秒曲线：心率、配速、海拔、步频。
+
+        数据来自归档里的原始 `.fit` 文件，是设备每秒记录一次的真实采样，
+        不是插值也不是估算。活动摘要里只有整段平均值，要看「第 30 分钟心率
+        掉到多少」「后程配速有没有崩」就必须用这个工具。
+
+        结果按列返回（每个指标一个数组，下标对齐 `series.offset_s`）。
+
+        三点要注意：
+        - **抽稀不影响极值。** `series` 最多给 `max_points` 个点（默认 300），
+          但 `summary` 里的最大 / 最小 / 平均值来自全量采样。不要拿 `series`
+          里的数字去说「最高心率」——被跳过的点上可能有更高的值。
+        - **没有瞬时最高速度。** `summary` 只给 `speed_avg_mps` 与
+          `speed_p95_mps`：GPS 漂移能让一次 6'51"/km 的慢跑冒出 86 km/h 的
+          单点，拿最大值当「最快配速」会得出荒谬结论。超过 20 m/s 的采样
+          直接按测坏了处理。
+        - **`cadence` 是单脚计数。** 跑步时每分钟步数约为它的 2 倍，
+          直接说「步频 89」会低得离谱。
+
+        另外两点：
+        - **`recorded_s` 可能大于 `duration_s`。** 按下停止后设备仍会继续记录
+          一段（实测最长多出 3 分钟），`duration_s` 是活动计时、`recorded_s`
+          才是文件的采样跨度。比较活动长度时用 `duration_s`。
+        - **`series_missing` 列出整列为空的指标。** 室内跑步机之类没有配速与
+          海拔，缺列不等于数值为零。
+
+        曲线不含坐标，也没有绝对时刻（只有相对开始的秒偏移），因此不存在
+        泄露路线或作息的问题。
+
+        参数：
+            activity_id  取自 list_activities 的 ID
+            max_points   series 最多给多少个点，默认 300，范围 20~3000
+        """
+        if not 20 <= max_points <= 3000:
+            raise ToolError(f"max_points 需在 20~3000 之间，收到 {max_points}")
+
+        with _store() as store:
+            row = store.find_activity(activity_id)
+            if row is None:
+                return {
+                    "error": "未找到该活动",
+                    "activity_id": activity_id,
+                    "hint": "请先用 list_activities 获取有效 ID",
+                }
+
+            act = row_to_activity(row)
+            stream, reason = _activity_stream(store, act)
+
+        if stream is None:
+            return _no_stream_response(activity_id, reason)
+
+        picks = downsample(stream.samples, max_points)
+        return privacy.stream(
+            act,
+            picks,
+            total=len(stream.samples),
+            summary=sample_summary(stream.samples),
+        )
+
+    @mcp.tool()
+    def get_pace_hr_drift(activity_id: str) -> dict[str, Any]:
+        """配速心率漂移（有氧解耦）：后半程是不是用更高的心率换同样的配速。
+
+        算法：把活动按时间切成前后两半，各自算「平均速度 ÷ 平均心率」，
+        再看后半比前半低了多少。`drift_pct` **正数表示后半程效率下降**，
+        也就是同样配速下心率更高了——跑步圈说的「解耦 5%」就是这个方向。
+
+        读数据时要知道三件事：
+
+        - **`reliable` 只说明样本够不够，不说明结论成立。** 时长不足 20 分钟
+          或每半点数不足 30 个时会标 false。样本够了也不代表漂移是「体能有
+          问题」——前半程冲太快、后半程放松，同样会让比值变化。
+        - **这个指标不区分「配速掉了」和「心率涨了」。** 返回里同时给了
+          `pace_change_s_per_km`（正数=变慢）与 `hr_change`（正数=升高），
+          要解释成因就看这两个数，不要只凭 `drift_pct` 下结论。
+        - **只在配速相对稳定的活动上有意义。** 间歇跑、冲刺训练本来就该前后
+          不同，硬套解耦没有意义；长距离有氧跑、骑行才是它的用武之地。
+
+        拿不到数据（没有心率、没有 FIT 文件、采样太少）时会返回
+        `available: false` 并说明原因，不是报错。
+
+        参数：
+            activity_id  取自 list_activities 的 ID
+        """
+        with _store() as store:
+            row = store.find_activity(activity_id)
+            if row is None:
+                return {
+                    "error": "未找到该活动",
+                    "activity_id": activity_id,
+                    "hint": "请先用 list_activities 获取有效 ID",
+                }
+            act = row_to_activity(row)
+            stream, reason = _activity_stream(store, act)
+
+        if stream is None:
+            return _no_stream_response(activity_id, reason)
+
+        result = pace_hr_drift(stream.samples)
+        if not result.get("available"):
+            out = privacy.drift(act, result)
+            out["hint"] = {
+                "no_hr_or_speed": (
+                    "这次活动没有同时记录心率与速度（例如力量训练、室内器械），"
+                    "算不出配速心率比。可以看 get_activity 的整段汇总值"
+                ),
+                "too_short": "采样跨度太短，前后半程分不出来",
+                "too_few_points": (
+                    "有效采样点太少，前后半程各自的平均值会被噪声主导，"
+                    "不足以谈漂移。至少要两半各 30 个点"
+                ),
+            }.get(str(result.get("reason")), "数据不足以计算漂移")
+            return out
+
+        return privacy.drift(act, result)
 
     @mcp.tool()
     def get_period_summary(

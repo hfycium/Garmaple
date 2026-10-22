@@ -98,10 +98,20 @@ def _as_float(value: Any) -> float | None:
         return None
 
 
+# 瞬时速度的物理上限。跑步的世界纪录约 10.4 m/s，骑行下坡可以到 20 m/s 以上；
+# 再高就不是人在动，而是 GPS 漂移。实测一个 6'51"/km 的慢跑里出现了
+# 24.05 m/s（86 km/h）的单点，换算成配速是 42 秒/公里。
+MAX_SPEED_MPS = 20.0
+
+
 def _speed_mps(value: Any) -> float | None:
-    """`enhanced_speed` 已是 m/s。0 是「静止」的有效值，但设备未测时也写 0。"""
+    """`enhanced_speed` 已是 m/s。超出物理上限的值按「测坏了」处理。
+
+    不清洗的话，一个毛刺点会同时污染序列（画出 42 秒/公里的配速）和汇总
+    （「最高速度 86 km/h」）。这类点只能算缺失，不能算极值。
+    """
     v = _as_float(value)
-    if v is None or v < 0:
+    if v is None or v < 0 or v > MAX_SPEED_MPS:
         return None
     return v
 
@@ -200,7 +210,11 @@ def downsample(samples: list[FitSample], max_points: int) -> list[FitSample]:
 
 
 def sample_summary(samples: Iterable[FitSample]) -> dict[str, Any]:
-    """全量统计，用于在抽稀后的返回里给准确极值。"""
+    """全量统计，用于在抽稀后的返回里给准确极值。
+
+    速度只给平均值与 95 分位，**不给最大值**：即便清洗掉超过 20 m/s 的毛刺，
+    剩下接近上限的单点仍然不能代表「最快配速」，反而会被当成能力指标引用。
+    """
     items = list(samples)
     hrs = [s.hr for s in items if s.hr is not None]
     speeds = [s.speed_mps for s in items if s.speed_mps is not None]
@@ -211,9 +225,22 @@ def sample_summary(samples: Iterable[FitSample]) -> dict[str, Any]:
         "hr_min": min(hrs) if hrs else None,
         "hr_max": max(hrs) if hrs else None,
         "hr_avg": round(sum(hrs) / len(hrs), 1) if hrs else None,
-        "speed_max_mps": round(max(speeds), 2) if speeds else None,
         "speed_avg_mps": round(sum(speeds) / len(speeds), 2) if speeds else None,
+        "speed_p95_mps": round(percentile(speeds, 0.95), 2) if speeds else None,
         "altitude_min_m": round(min(alts), 1) if alts else None,
         "altitude_max_m": round(max(alts), 1) if alts else None,
         "cadence_max": max(cads) if cads else None,
     }
+
+
+def percentile(values: list[float], fraction: float) -> float:
+    """线性插值分位数，避免为了一个数引入 numpy。"""
+    if not values:
+        raise ValueError("空序列没有分位数")
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = fraction * (len(ordered) - 1)
+    low = int(pos)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (pos - low)

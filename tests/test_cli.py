@@ -6,21 +6,26 @@
 
 from __future__ import annotations
 
+import io
 import json
 import zipfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from garmaple.cli import main
 from garmaple.config import Config
 from garmaple.store import Store
 
+from .fit_factory import build_fit, sample_at
 from .test_activities import make_raw
 from .test_daily import make_block
 from .test_metrics import make_prediction, make_vo2max
 from .test_records import make_gear, make_gear_payload, make_raw as make_record
 from .test_sleep import make_sleep
 from .test_training import make_block as make_training
+
+# make_raw 默认的开始时间；造 FIT 时必须与它对齐，否则定位不上
+_ACTIVITY_START_MS = 1_740_000_000_000
 
 
 def sleep_block(wake_day: str) -> dict[str, object]:
@@ -44,6 +49,7 @@ def build_archive(
     personal: int | None = None,
     gears: int | None = None,
     superseded: bool = False,
+    fits: int = 0,
 ) -> Path:
     """造一个最小导出包：活动 + 日汇总 + 睡眠 + 训练 + 预测 + 摄氧量 + 纪录 + 装备。
 
@@ -56,7 +62,14 @@ def build_archive(
     """
     path = root / "export.zip"
     payload = [{"summarizedActivitiesExport": [
-        make_raw(activityId=1000 + i) for i in range(activities)
+        # 每个活动相差 1 小时：这样第 i 个 FIT 能且只能对上第 i 个活动，
+        # 「有活动没有 FIT」才测得出来
+        make_raw(
+            activityId=1000 + i,
+            beginTimestamp=_ACTIVITY_START_MS + i * 3_600_000,
+            startTimeLocal=_ACTIVITY_START_MS + i * 3_600_000 + 8 * 3_600_000,
+        )
+        for i in range(activities)
     ]}]
     daily = [
         make_block(calendarDate=f"2026-07-{20 + i:02d}") for i in range(days)
@@ -182,13 +195,47 @@ def build_archive(
                 "DI_CONNECT/DI-Connect-Fitness/9000_gear.json",
                 json.dumps(gear_block),
             )
+        if fits:
+            # 内嵌 zip 里放逐秒记录。第 i 个 FIT 的开始时间与第 i 个活动对齐，
+            # 因此 fits 小于活动数时，剩下的活动就是「有活动没有 FIT」的情形。
+            inner = io.BytesIO()
+            with zipfile.ZipFile(inner, "w") as izf:
+                for i in range(fits):
+                    base = datetime.fromtimestamp(
+                        (_ACTIVITY_START_MS + i * 3_600_000) / 1000, tz=timezone.utc
+                    )
+                    izf.writestr(
+                        f"0000000000000_{i}.fit",
+                        build_fit(
+                            start=base,
+                            samples=[
+                                sample_at(
+                                    base,
+                                    sec,
+                                    # 心率随时间缓慢上升（每 20 秒 +1），
+                                    # 配速恒定——正是「配速没变但心率涨了」
+                                    # 的有氧解耦形态
+                                    hr=120 + sec // 20,
+                                    speed_mps=3.0,
+                                    altitude_m=20.0 + sec / 100,
+                                    cadence=85,
+                                    distance_m=3.0 * sec,
+                                )
+                                for sec in range(0, 1300, 2)
+                            ],
+                        ),
+                    )
+            zf.writestr(
+                "DI_CONNECT/DI-Connect-Uploaded-Files/UploadedFiles_0-_Part1.zip",
+                inner.getvalue(),
+            )
     return path
 
 
-def make_config(tmp_path: Path) -> Config:
+def make_config(tmp_path: Path, **kwargs: object) -> Config:
     data = tmp_path / "data"
     data.mkdir()
-    build_archive(data)
+    build_archive(data, **kwargs)
     return Config(data_dir=data, cache_dir=tmp_path / "cache", privacy="strict")
 
 
@@ -371,7 +418,22 @@ def test_doctor_reports_counts(tmp_path: Path, capsys) -> None:
     assert "最大摄氧量 2 天" in out
     assert "个人最佳   2 条" in out
     assert "装备       2 双" in out
+    assert "逐秒记录   无" in out
     assert "一切就绪" in out
+
+
+def test_index_and_doctor_report_fit_coverage(tmp_path: Path, capsys) -> None:
+    """归档里带逐秒记录时，index 与 doctor 都要报出覆盖了多少次活动。"""
+    cfg = make_config(tmp_path, fits=1)
+    args = ["--data", str(cfg.data_dir), "--cache", str(cfg.cache_dir)]
+
+    assert main(args + ["index"]) == 0
+    out = capsys.readouterr().out
+    assert "逐秒记录   1 个活动 FIT（仅索引文件头）" in out
+    assert "逐秒记录   1 次活动可查" in out
+
+    assert main(args + ["doctor"]) == 0
+    assert "逐秒记录   1/2 条活动有 FIT 文件" in capsys.readouterr().out
 
 
 def test_doctor_fails_before_index(tmp_path: Path, capsys) -> None:

@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from garmaple.stats import human_duration, human_pace, summarize, zone_summary
+from garmaple.stats import (
+    pace_hr_drift,
+    human_duration,
+    human_pace,
+    pace_from_speed,
+    summarize,
+    zone_summary,
+)
 
 
 def row(**overrides: object) -> dict[str, object]:
@@ -198,3 +205,94 @@ def test_zone_summary_tolerates_missing_columns() -> None:
     assert out["activities"] == 1
     assert out["with_zone_data"] == 0
     assert out["total_s"] == 0
+
+
+def test_pace_from_speed_returns_none_when_standstill():
+    """静止点不给配速。
+
+    0.01 m/s 照 1000/speed 算会得到 100000"/km，画出来会把整条配速曲线压平。
+    """
+    assert pace_from_speed(0.0) is None
+    assert pace_from_speed(0.29) is None
+    assert pace_from_speed(None) is None
+    assert pace_from_speed(3.0) == 333  # 5'33"/km
+
+
+def test_pace_from_speed_keeps_walking_speed():
+    assert pace_from_speed(1.4) == 714  # 11'54"/km，快走，仍是有效配速
+
+
+# ---------------- 配速心率漂移 ----------------
+
+
+class _Sample:
+    """只为算解耦造的最小采样：只需要偏移、心率、速度。"""
+
+    __slots__ = ("offset_s", "hr", "speed_mps")
+
+    def __init__(self, offset_s: int, hr: int | None, speed_mps: float | None) -> None:
+        self.offset_s = offset_s
+        self.hr = hr
+        self.speed_mps = speed_mps
+
+
+def _series(n: int, *, hr_of, speed_of, step: int = 2) -> list[_Sample]:
+    return [_Sample(i * step, hr_of(i * step), speed_of(i * step)) for i in range(n)]
+
+
+def test_drift_is_positive_when_pace_holds_but_hr_climbs():
+    """配速不变、心率上升 = 后半程效率下降，drift 为正。"""
+    samples = _series(650, hr_of=lambda t: 140 + t // 60, speed_of=lambda t: 3.0)
+    out = pace_hr_drift(samples)
+    assert out["available"] is True
+    assert out["drift_pct"] > 5
+    assert out["reliable"] is True
+
+
+def test_drift_is_negative_when_hr_holds_but_pace_improves():
+    """心率不变、越跑越快 = 效率提升，drift 为负。"""
+    samples = _series(600, hr_of=lambda t: 150, speed_of=lambda t: 2.5 + t / 2000)
+    out = pace_hr_drift(samples)
+    assert out["available"] is True
+    assert out["drift_pct"] < -5
+
+
+def test_drift_ignores_standstill_samples():
+    """静止点不参与平均。
+
+    否则前半程混进几个等红灯的 0 速度点，平均速度被拉低，会凭空造出一个
+    「后半程效率提升」的结论。
+    """
+    moving = _series(600, hr_of=lambda t: 150, speed_of=lambda t: 3.0)
+    with_stops = [
+        *[s for s in moving[: 300]],
+        *[_Sample(600 + i * 2, 150, 0.0) for i in range(50)],  # 中途停了一会儿
+        *[s for s in moving[300:]],
+    ]
+    clean = pace_hr_drift(moving)
+    dirty = pace_hr_drift(with_stops)
+    assert clean["available"] and dirty["available"]
+    assert dirty["drift_pct"] == pytest.approx(clean["drift_pct"], abs=1.0)
+
+
+def test_drift_needs_enough_points():
+    samples = _series(20, hr_of=lambda t: 150, speed_of=lambda t: 3.0)
+    out = pace_hr_drift(samples)
+    assert out["available"] is False
+    assert out["reason"] == "too_few_points"
+    assert out["needed"] == 60
+
+
+def test_drift_unavailable_without_heart_rate():
+    samples = _series(600, hr_of=lambda t: None, speed_of=lambda t: 3.0)
+    out = pace_hr_drift(samples)
+    assert out["available"] is False
+    assert out["reason"] == "no_hr_or_speed"
+
+
+def test_drift_flags_short_activities_as_unreliable():
+    """点数够但时长不足 20 分钟：能算，但标 unreliable。"""
+    samples = _series(300, hr_of=lambda t: 150, speed_of=lambda t: 3.0, step=2)  # 598s
+    out = pace_hr_drift(samples)
+    assert out["available"] is True
+    assert out["reliable"] is False

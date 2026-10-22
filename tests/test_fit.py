@@ -147,3 +147,43 @@ def test_sample_summary_uses_full_data_not_downsampled():
 
 # ---------------- 时间对齐 ----------------
 # `_parse_utc` / `_same_moment` 属于定位层，测试放在 test_streams.py
+
+
+# ---------------- 速度清洗 ----------------
+
+
+def test_parse_fit_drops_impossible_speed():
+    """超过 20 m/s 的瞬时速度按「测坏了」处理。
+
+    真实数据里一次 6'51"/km 的慢跑出现过 24.05 m/s（86 km/h）的单点，
+    换算成配速是 42 秒/公里。不清洗会同时污染序列与汇总。
+    """
+    stream = make_stream(
+        [
+            sample_at(START, 0, speed_mps=3.0),
+            sample_at(START, 2, speed_mps=24.05),  # 毛刺
+            sample_at(START, 4, speed_mps=3.2),
+        ]
+    )
+    assert stream is not None
+    assert [s.speed_mps for s in stream.samples] == [pytest.approx(3.0), None, pytest.approx(3.2)]
+
+
+def test_summary_reports_p95_not_max_speed():
+    """汇总给 95 分位而不是最大值，避免把毛刺当能力指标。"""
+    samples = [FitSample(offset_s=i, speed_mps=3.0) for i in range(99)]
+    samples.append(FitSample(offset_s=99, speed_mps=19.5))  # 仍在上限内，但不该当代表值
+    summary = sample_summary(samples)
+    assert "speed_max_mps" not in summary
+    assert summary["speed_p95_mps"] < 5
+    assert summary["speed_avg_mps"] == pytest.approx(3.17, abs=0.05)
+
+
+def test_percentile_interpolates():
+    from garmaple.parser.fit import percentile
+
+    assert percentile([1, 2, 3, 4, 5], 0.5) == 3
+    assert percentile([10], 0.95) == 10
+    assert percentile([1, 2], 1.0) == 2
+    with pytest.raises(ValueError):
+        percentile([], 0.5)

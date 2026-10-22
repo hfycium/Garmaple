@@ -19,6 +19,7 @@ from datetime import datetime
 
 from .parser.activities import Activity
 from .parser.daily import DailyStat
+from .parser.fit import FitSample
 from .parser.metrics import RACE_DISTANCES_KM, RacePrediction, Vo2maxSample
 from .parser.records import (
     COUNT,
@@ -34,7 +35,7 @@ from .parser.records import (
 )
 from .parser.sleep import SleepRecord
 from .parser.training import TrainingDay
-from .stats import human_duration, human_pace
+from .stats import human_duration, human_pace, pace_from_speed
 
 # 固定盐值：让伪 ID 在多次会话间保持稳定，又不直接暴露 activityId
 _ID_SALT = "garmaple-v1"
@@ -219,6 +220,105 @@ class Privacy:
                 }
             )
 
+        return self._strip_none(out)
+
+    def stream(
+        self,
+        act: Activity,
+        samples: list[FitSample],
+        total: int,
+        summary: dict[str, object],
+    ) -> dict[str, object]:
+        """单次活动的逐秒曲线。
+
+        用**列式**（每个指标一个数组）而不是数组套对象：同样 300 个点，列式
+        能省掉大半体积，模型按列读也不更难。
+
+        不含坐标。FIT 里其实有 `position_lat` / `position_long`，但逐秒轨迹能
+        完整还原住址与常去地点，比活动摘要里的起终点敏感得多，因此解析层根本
+        不读这两列——三档隐私在这里一视同仁，不是靠这一层过滤。
+
+        也没有绝对时刻，只有相对开始的秒偏移，所以不存在「几点出门」的信息。
+        """
+        offsets = [s.offset_s for s in samples]
+        columns: dict[str, list[object]] = {
+            "hr": [s.hr for s in samples],
+            "pace_s_per_km": [pace_from_speed(s.speed_mps) for s in samples],
+            "altitude_m": [
+                round(s.altitude_m, 1) if s.altitude_m is not None else None for s in samples
+            ],
+            "cadence": [s.cadence for s in samples],
+        }
+        # 整列都是 None 就不输出。室内活动只有心率，把 pace/altitude/cadence
+        # 三列的空数组一起塞进去既浪费体积，也容易被读成「配速为零」。
+        present = {k: v for k, v in columns.items() if any(x is not None for x in v)}
+        absent = [k for k in columns if k not in present]
+
+        out: dict[str, object] = {
+            "id": self.public_id(act.activity_id),
+            "sport": act.sport,
+            "when": self.when(act.utc_start, act.local_start),
+            "duration_s": round(act.duration_s) if act.duration_s else None,
+            "recorded_s": offsets[-1] if offsets else None,
+            "points": len(samples),
+            "total_points": total,
+            "downsampled": len(samples) < total,
+            "interval_s": (
+                round(offsets[-1] / max(len(offsets) - 1, 1)) if len(offsets) > 1 else None
+            ),
+            "series": {"offset_s": offsets, **present},
+            "summary": summary,
+        }
+        if absent:
+            out["series_missing"] = absent
+        return self._strip_none(out)
+
+    def drift(self, act: Activity, result: dict[str, object]) -> dict[str, object]:
+        """配速心率漂移（有氧解耦）。
+
+        数值口径由 `stats.pace_hr_drift` 决定，这里只补可读文本。两个变化量
+        都按「后半减前半」给，所以**配速正数=变慢**、**心率正数=升高**，
+        与 `drift_pct` 正数=效率下降是同一个方向，不会互相矛盾。
+        """
+        out: dict[str, object] = {
+            "id": self.public_id(act.activity_id),
+            "sport": act.sport,
+            "when": self.when(act.utc_start, act.local_start),
+            "duration_s": round(act.duration_s) if act.duration_s else None,
+        }
+
+        if not result.get("available"):
+            out["available"] = False
+            out["reason"] = result.get("reason")
+            if "points" in result:
+                out["points"] = result["points"]
+                out["needed"] = result.get("needed")
+            return self._strip_none(out)
+
+        first = result["first_half"]
+        second = result["second_half"]
+        pace_change = None
+        if first.get("avg_pace_s_per_km") and second.get("avg_pace_s_per_km"):
+            pace_change = second["avg_pace_s_per_km"] - first["avg_pace_s_per_km"]
+
+        out.update(
+            {
+                "available": True,
+                "first_half": {
+                    **first,
+                    "avg_pace": human_pace(first.get("avg_pace_s_per_km")),
+                },
+                "second_half": {
+                    **second,
+                    "avg_pace": human_pace(second.get("avg_pace_s_per_km")),
+                },
+                "drift_pct": result["drift_pct"],
+                "pace_change_s_per_km": pace_change,
+                "hr_change": round(second["avg_hr"] - first["avg_hr"], 1),
+                "span_s": result.get("span_s"),
+                "reliable": result.get("reliable"),
+            }
+        )
         return self._strip_none(out)
 
     def day(self, d: DailyStat) -> dict[str, object]:

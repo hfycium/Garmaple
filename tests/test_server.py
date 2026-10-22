@@ -18,13 +18,15 @@ from garmaple.config import Config
 from garmaple.server import build_server
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 
+from garmaple.privacy import pseudo_activity_id
+
 from .test_cli import build_archive
 
 
-def prepared(tmp_path: Path, days: int = 3, privacy: str = "strict") -> Config:
+def prepared(tmp_path: Path, days: int = 3, privacy: str = "strict", fits: int = 0) -> Config:
     data = tmp_path / "data"
     data.mkdir(parents=True, exist_ok=True)
-    build_archive(data, activities=2, days=days)
+    build_archive(data, activities=2, days=days, fits=fits)
     cfg = Config(data_dir=data, cache_dir=tmp_path / "cache", privacy=privacy)
     main(["--data", str(cfg.data_dir), "--cache", str(cfg.cache_dir), "index"])
     return cfg
@@ -49,7 +51,9 @@ def test_daily_summary_tool_is_registered(tmp_path: Path) -> None:
     assert "get_personal_records" in names
     assert "get_gear_mileage" in names
     assert "get_hr_zones" in names
-    assert len(names) == 12
+    assert "get_activity_streams" in names
+    assert "get_pace_hr_drift" in names
+    assert len(names) == 14
 
 
 def test_hr_zones_distribution(tmp_path: Path) -> None:
@@ -689,3 +693,121 @@ def test_missing_index_says_how_to_fix(tmp_path: Path) -> None:
         call(cfg, "get_data_overview")
     assert not isinstance(excinfo.value, UnexpectedToolError)
     assert "garmaple index" in str(excinfo.value)
+
+
+# ---------------- 逐秒曲线 ----------------
+
+
+def test_activity_streams_is_registered(tmp_path: Path) -> None:
+    assert "get_activity_streams" in tool_names(prepared(tmp_path))
+
+
+def test_activity_streams_returns_second_by_second_series(tmp_path: Path) -> None:
+    """有 FIT 时返回逐点序列，且极值来自全量而不是抽稀后的点。"""
+    cfg = prepared(tmp_path, fits=1)
+    out = call(cfg, "get_activity_streams", {"activity_id": pseudo_activity_id(1000)})
+
+    assert out.get("available") is not False
+    assert out["total_points"] == 650  # 0,2,...,1298
+    assert out["points"] == 300  # 默认抽稀到 300
+    assert out["downsampled"] is True
+    assert out["series"]["offset_s"][0] == 0
+    assert out["series"]["offset_s"][-1] == 1298
+    assert out["series"]["hr"][0] == 120
+    assert out["summary"]["hr_max"] == 184  # 120 + 1298//20
+
+
+def test_activity_streams_downsamples_but_keeps_full_summary(tmp_path: Path) -> None:
+    """抽稀只影响 series，不影响 summary 里的极值。"""
+    cfg = prepared(tmp_path, fits=1)
+    out = call(
+        cfg,
+        "get_activity_streams",
+        {"activity_id": pseudo_activity_id(1000), "max_points": 20},
+    )
+    assert out["points"] == 20
+    assert out["total_points"] == 650
+    assert out["downsampled"] is True
+    assert out["summary"]["hr_max"] == 184
+
+
+def test_activity_streams_without_fit_files_explains(tmp_path: Path) -> None:
+    """归档里没有 .fit 时给说明，不要当成错误。"""
+    cfg = prepared(tmp_path)  # fits=0
+    out = call(cfg, "get_activity_streams", {"activity_id": pseudo_activity_id(1000)})
+    assert out["available"] is False
+    assert "garmaple index" in out["hint"]
+
+
+def test_activity_streams_reports_activity_without_fit(tmp_path: Path) -> None:
+    """有 FIT 但只有第一个活动能对上，第二个应给「没有对应文件」而不是空序列。
+
+    build_archive 里第 i 个 FIT 的开始时间比活动晚 i 小时，因此只有第 0 个
+    能对齐——这正好复刻真实数据里「305 个活动、304 个 FIT」的情形。
+    """
+    cfg = prepared(tmp_path, fits=1)
+    out = call(cfg, "get_activity_streams", {"activity_id": pseudo_activity_id(1001)})
+    assert out["available"] is False
+    assert "没有对应的 FIT" in out["hint"]
+
+
+def test_activity_streams_unknown_activity(tmp_path: Path) -> None:
+    cfg = prepared(tmp_path, fits=1)
+    out = call(cfg, "get_activity_streams", {"activity_id": "act_不存在"})
+    assert out["error"] == "未找到该活动"
+
+
+def test_activity_streams_rejects_absurd_max_points(tmp_path: Path) -> None:
+    cfg = prepared(tmp_path, fits=1)
+    with pytest.raises(ToolError) as excinfo:
+        call(cfg, "get_activity_streams", {"activity_id": pseudo_activity_id(1000),
+                                           "max_points": 5})
+    assert not isinstance(excinfo.value, UnexpectedToolError)
+    assert "max_points" in str(excinfo.value)
+
+
+def test_activity_streams_never_exposes_coordinates(tmp_path: Path) -> None:
+    """逐秒曲线在三档隐私下都不含坐标——解析层就没读 position 字段。"""
+    for level in ("strict", "normal", "raw"):
+        cfg = prepared(tmp_path / level, fits=1, privacy=level)
+        out = call(cfg, "get_activity_streams", {"activity_id": pseudo_activity_id(1000)})
+        flat = json.dumps(out, ensure_ascii=False)
+        assert "lat" not in flat and "lon" not in flat
+        assert "location" not in flat
+
+
+# ---------------- 配速心率漂移 ----------------
+
+
+def test_pace_hr_drift_is_registered(tmp_path: Path) -> None:
+    assert "get_pace_hr_drift" in tool_names(prepared(tmp_path))
+
+
+def test_pace_hr_drift_detects_cardiac_drift(tmp_path: Path) -> None:
+    """合成数据是「配速恒定、心率每 20 秒 +1」，正是纯心率漂移的形态。
+
+    前后半平均心率约 135.8 与 168.2，效率比值降 19.3%，因此 drift_pct 为正。
+    """
+    cfg = prepared(tmp_path, fits=1)
+    out = call(cfg, "get_pace_hr_drift", {"activity_id": pseudo_activity_id(1000)})
+
+    assert out["available"] is True
+    assert out["drift_pct"] == pytest.approx(19.3, abs=0.3)
+    assert out["drift_pct"] > 0  # 正数 = 后半程效率下降
+    assert out["pace_change_s_per_km"] == 0  # 配速没变
+    assert out["hr_change"] == pytest.approx(32.4, abs=0.3)  # 心率升了
+    assert out["reliable"] is True
+    assert out["first_half"]["avg_pace"] and out["second_half"]["avg_pace"]
+
+
+def test_pace_hr_drift_without_fit_files_explains(tmp_path: Path) -> None:
+    cfg = prepared(tmp_path)  # fits=0
+    out = call(cfg, "get_pace_hr_drift", {"activity_id": pseudo_activity_id(1000)})
+    assert out["available"] is False
+    assert "garmaple index" in out["hint"]
+
+
+def test_pace_hr_drift_unknown_activity(tmp_path: Path) -> None:
+    cfg = prepared(tmp_path, fits=1)
+    out = call(cfg, "get_pace_hr_drift", {"activity_id": "act_不存在"})
+    assert out["error"] == "未找到该活动"
