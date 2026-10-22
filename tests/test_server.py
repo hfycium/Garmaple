@@ -43,7 +43,8 @@ def tool_names(cfg: Config) -> list[str]:
 def test_daily_summary_tool_is_registered(tmp_path: Path) -> None:
     names = tool_names(prepared(tmp_path))
     assert "get_daily_summary" in names
-    assert len(names) == 6
+    assert "get_training_status" in names
+    assert len(names) == 7
 
 
 def test_daily_summary_defaults_to_recent_days_in_order(tmp_path: Path) -> None:
@@ -240,6 +241,90 @@ def test_overview_reports_sleep_coverage(tmp_path: Path) -> None:
     assert "不含睡眠评分" in out["sleep"]["note"]
 
 
+# ---------------- get_training_status ----------------
+
+def test_training_returns_days_in_order(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_training_status", {})
+    assert out["count"] == 3
+    assert [d["date"] for d in out["days"]] == [
+        "2026-07-20", "2026-07-21", "2026-07-22",
+    ]
+    assert out["days"][0]["status"] == "PRODUCTIVE"
+    assert out["days"][0]["status_label"] == "有成效"
+
+
+def test_training_latest_matches_the_last_day(tmp_path: Path) -> None:
+    """`latest` 存在的意义是回答「我现在的状态」时不用翻数组。"""
+    out = call(prepared(tmp_path), "get_training_status", {})
+    assert out["latest"] == out["days"][-1]
+
+
+def test_training_merges_same_day_snapshots(tmp_path: Path) -> None:
+    """同一天两条快照只出一天，且取时间更晚那条（周负荷 300 而非 100）。"""
+    out = call(prepared(tmp_path), "get_training_status", {})
+    assert out["count"] == 3
+    assert {d["weekly_load"] for d in out["days"]} == {300}
+
+
+def test_training_reports_load_position_against_tunnel(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_training_status", {"limit": 1})
+    day = out["days"][0]
+    assert day["load_tunnel"] == {"min": 281, "max": 640}
+    assert day["load_position"] == "in"  # 300 落在 281~640
+
+
+def test_training_counts_are_provided_for_ranges(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_training_status", {})
+    assert out["status_counts"] == {"PRODUCTIVE": 3}
+    assert out["load_position_counts"] == {"in": 3}
+
+
+def test_training_single_day_has_no_counts(tmp_path: Path) -> None:
+    """只有一天时计数是噪音，不给。"""
+    out = call(prepared(tmp_path), "get_training_status", {"limit": 1})
+    assert "status_counts" not in out
+    assert "load_position_counts" not in out
+
+
+def test_training_truncates_to_most_recent(tmp_path: Path) -> None:
+    out = call(
+        prepared(tmp_path), "get_training_status",
+        {"start_date": "2026-07-20", "end_date": "2026-07-22", "limit": 2},
+    )
+    assert out["truncated"] is True
+    assert [d["date"] for d in out["days"]] == ["2026-07-21", "2026-07-22"]
+    assert "最近" in out["note"]
+
+
+def test_training_empty_range_gives_hint(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_training_status", {"start_date": "2099-01-01"})
+    assert out["count"] == 0
+    assert out["days"] == []
+    assert "get_data_overview" in out["hint"]
+
+
+def test_training_is_privacy_filtered(tmp_path: Path) -> None:
+    """strict 下不给账号标识，也不给快照时刻；负荷与状态照常给。"""
+    out = call(prepared(tmp_path), "get_training_status", {})
+    text = json.dumps(out, ensure_ascii=False)
+    assert "user_profile_id" not in text
+    assert "updated_at" not in text
+    assert out["days"][0]["weekly_load"] == 300
+
+
+def test_training_raw_exposes_user_profile(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path, privacy="raw"), "get_training_status", {"limit": 1})
+    assert out["days"][0]["user_profile_id"] == 999
+
+
+def test_overview_reports_training_coverage(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_data_overview")
+    assert out["training_status"]["days"] == 3
+    assert out["training_status"]["date_from"] == "2026-07-20"
+    assert out["training_status"]["date_to"] == "2026-07-22"
+    assert "CTL" in out["training_status"]["note"]
+
+
 # ---------- 预期内失败：必须让模型看见原因 ----------
 #
 # 为什么这几条要单独测：SDK 只把 ToolError 的文本透给模型；其他异常被当成
@@ -254,7 +339,8 @@ def test_expected_failures_are_not_wrapped_as_crash(tmp_path: Path) -> None:
         ("get_daily_summary", {"start_date": "2026/07/20"}),
         ("list_activities", {"start_date": "13-01-2026"}),
         ("get_period_summary", {"start_date": "2026-07-22", "end_date": "2026-07-20"}),
-        ("get_period_summary", {"start_date": "2026-07-22", "end_date": "2026-07-20"}),
+        ("get_training_status", {"start_date": "2026-07-22", "end_date": "2026-07-20"}),
+        ("get_training_status", {"start_date": "2026-13-01"}),
     ]
     for name, args in cases:
         with pytest.raises(ToolError) as excinfo:

@@ -6,13 +6,20 @@
 from __future__ import annotations
 
 import sys
+from collections import Counter
 from datetime import date
 from typing import Any
 
 from .config import Config
 from .privacy import Privacy
 from .stats import human_duration, human_pace, summarize
-from .store import Store, row_to_activity, row_to_daily, row_to_sleep
+from .store import (
+    Store,
+    row_to_activity,
+    row_to_daily,
+    row_to_sleep,
+    row_to_training,
+)
 
 INSTRUCTIONS = """\
 本服务读取用户本地的佳明（Garmin）导出数据，不联网、不上传。
@@ -26,13 +33,16 @@ INSTRUCTIONS = """\
 自行调整 GARMAPLE_PRIVACY 配置，而不是尝试绕过限制。
 
 当前索引包含：活动摘要、每日 wellness 汇总（步数、静息心率、压力、
-身体电量、强度分钟）、睡眠（时长与分期）。
+身体电量、强度分钟）、睡眠（时长与分期）、训练状态（状态判定、
+周训练负荷、负荷隧道）。
 
 两点必须注意：
 - 睡眠记录按**醒来日**归档。问「昨晚睡得怎么样」要查今天那条，
   查昨天会拿到前一晚的数据。
-- 官方导出包里没有睡眠评分数值，也没有训练负荷（CTL/ATL/TSB）、
-  逐秒采样等数据。被问到时直接说明当前没有这项能力，不要猜测或估算数值。
+- 官方导出包里没有睡眠评分数值，也没有 CTL / ATL / TSB 三个体能指标，
+  也没有逐秒采样。训练状态与周训练负荷是设备自己判定的结果，
+  与 Connect 上显示的一致，但不要把它当成 CTL 用，也不要自行换算。
+  被问到时直接说明当前没有这项能力，不要猜测或估算数值。
 """
 
 
@@ -105,6 +115,15 @@ def build_server(cfg: Config) -> Any:
                     "date_from": slo,
                     "date_to": shi,
                     "note": "按醒来日归档；官方导出包不含睡眠评分",
+                }
+            training_count = store.count_training()
+            if training_count:
+                tlo, thi = store.training_range()
+                result["training_status"] = {
+                    "days": training_count,
+                    "date_from": tlo,
+                    "date_to": thi,
+                    "note": "设备判定的结果；不含 CTL / ATL / TSB",
                 }
             return result
 
@@ -305,6 +324,81 @@ def build_server(cfg: Config) -> Any:
             if truncated:
                 result["truncated"] = True
                 result["note"] = f"区间内记录多于 {capped} 晚，只返回最近 {capped} 晚"
+            return result
+
+    @mcp.tool()
+    def get_training_status(
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: int = 31,
+    ) -> dict[str, Any]:
+        """查看设备判定的训练状态与负荷隧道。
+
+        这些是**手表自己算出的结论**，不是本工具从活动数据推的，因此与
+        Connect 上「训练状态」页一致；导出包里没有的，这里也没有。
+
+        读结果前必须知道的四点：
+
+        1. `status` 是训练状态判定。`no_status` 表示**设备数据不足、尚无法判定**，
+           不是「没练好」，不要把它归到负面状态里。
+        2. `load_position` 是周训练负荷相对 `load_tunnel`（最优负荷区间）的位置，
+           取 below / in / above。低于区间不等于退步——恢复周本就该低。
+        3. 归档里**没有 CTL / ATL / TSB**。`weekly_load` 是佳明的周负荷累计值，
+           与 CTL 不是同一个量：不要当作体能值使用，也不要自行换算。
+        4. 一天一条。设备一天会写多条同步快照，这里只留当日最后一次。
+
+        参数：
+            start_date / end_date: YYYY-MM-DD，含端点，均可省略；
+                两者都省略时返回最近 limit 天
+            limit: 最多返回天数，默认 31，上限 120；区间结果超长时只保留最近的部分
+
+        结果按日期正序，`latest` 是最后一天那条，回答「我现在的训练状态」直接用它。
+        状态与趋势都带中文标签，`status_label` 比英文枚举更不容易读反。
+        """
+        capped = max(1, min(int(limit or 31), 120))
+        start = _date(start_date, "start_date")
+        end = _date(end_date, "end_date")
+        if start and end and start > end:
+            raise ToolError("start_date 不能晚于 end_date")
+
+        with _store() as store:
+            if start is None and end is None:
+                rows = store.query_training(limit=capped, order="desc")
+                truncated = False
+            else:
+                rows = store.query_training(start=start, end=end, order="asc")
+                truncated = len(rows) > capped
+                if truncated:
+                    rows = rows[-capped:]
+
+            days = [privacy.training(row_to_training(r)) for r in rows]
+            if not days:
+                return {
+                    "count": 0,
+                    "days": [],
+                    "hint": "该区间没有训练状态记录。可用 get_data_overview 确认覆盖范围；"
+                            "若索引早于本次升级，请重新运行 garmaple index。",
+                }
+
+            result: dict[str, Any] = {
+                "count": len(days),
+                "range": {"from": days[0]["date"], "to": days[-1]["date"]},
+                "latest": days[-1],
+                "days": days,
+            }
+            # 多天时给出计数，省得模型自己数还数错
+            if len(days) > 1:
+                result["status_counts"] = dict(
+                    Counter(d["status"] for d in days).most_common()
+                )
+                positions = Counter(
+                    d["load_position"] for d in days if d.get("load_position")
+                )
+                if positions:
+                    result["load_position_counts"] = dict(positions.most_common())
+            if truncated:
+                result["truncated"] = True
+                result["note"] = f"区间内记录多于 {capped} 天，只返回最近 {capped} 天"
             return result
 
     return mcp
