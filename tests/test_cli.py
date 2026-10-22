@@ -16,16 +16,25 @@ from garmaple.store import Store
 
 from .test_activities import make_raw
 from .test_daily import make_block
+from .test_sleep import make_sleep
 
 
-def build_archive(root: Path, activities: int = 2, days: int = 2) -> Path:
-    """造一个最小导出包：活动摘要 + 每日汇总。"""
+def build_archive(root: Path, activities: int = 2, days: int = 2, sleeps: int | None = None) -> Path:
+    """造一个最小导出包：活动摘要 + 每日汇总 + 睡眠。
+
+    `sleeps` 为 None 时与 `days` 同天数；显式传 0 则不写睡眠分片，
+    用于验证「缺这份数据也能正常索引」。
+    """
     path = root / "export.zip"
     payload = [{"summarizedActivitiesExport": [
         make_raw(activityId=1000 + i) for i in range(activities)
     ]}]
     daily = [
         make_block(calendarDate=f"2026-07-{20 + i:02d}") for i in range(days)
+    ]
+    sleep_count = days if sleeps is None else sleeps
+    sleep = [
+        make_sleep(calendarDate=f"2026-07-{20 + i:02d}") for i in range(sleep_count)
     ]
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr(
@@ -36,6 +45,11 @@ def build_archive(root: Path, activities: int = 2, days: int = 2) -> Path:
             "DI_CONNECT/DI-Connect-Aggregator/UDSFile_2026-07-20_2026-07-30.json",
             json.dumps(daily),
         )
+        if sleep:
+            zf.writestr(
+                "DI_CONNECT/DI-Connect-Wellness/2026-07-20_2026-07-30_9000_sleepData.json",
+                json.dumps(sleep),
+            )
     return path
 
 
@@ -51,12 +65,29 @@ def test_index_builds_both_tables(tmp_path: Path, capsys) -> None:
     assert main(["--data", str(cfg.data_dir), "--cache", str(cfg.cache_dir), "index"]) == 0
 
     out = capsys.readouterr().out
-    assert "活动分片" in out and "日汇总分片" in out
+    assert "活动分片" in out and "日汇总分片" in out and "睡眠分片" in out
     assert "库内活动   2 条" in out
     assert "库内日汇总 2 天" in out
+    assert "库内睡眠   2 晚" in out
 
     with Store(cfg.db_path) as store:
         assert store.count_activities() == 2
+        assert store.count_days() == 2
+        assert store.count_sleeps() == 2
+
+
+def test_index_without_sleep_shard_still_works(tmp_path: Path, capsys) -> None:
+    """没有睡眠数据时只跳过睡眠，不该整体失败。"""
+    data = tmp_path / "data"
+    data.mkdir()
+    build_archive(data, sleeps=0)
+    cfg = Config(data_dir=data, cache_dir=tmp_path / "cache")
+
+    assert main(["--data", str(cfg.data_dir), "--cache", str(cfg.cache_dir), "index"]) == 0
+    out = capsys.readouterr().out
+    assert "归档中没有 *sleepData.json" in out
+    with Store(cfg.db_path) as store:
+        assert store.count_sleeps() == 0
         assert store.count_days() == 2
 
 
@@ -107,6 +138,7 @@ def test_doctor_reports_counts(tmp_path: Path, capsys) -> None:
     out = capsys.readouterr().out
     assert "活动       2 条" in out
     assert "每日汇总   2 天" in out
+    assert "睡眠       2 晚" in out
     assert "一切就绪" in out
 
 
