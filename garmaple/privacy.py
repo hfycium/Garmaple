@@ -20,6 +20,7 @@ from datetime import datetime
 from .parser.activities import Activity
 from .parser.daily import DailyStat
 from .parser.metrics import RACE_DISTANCES_KM, RacePrediction, Vo2maxSample
+from .parser.records import COUNT, DAYS, METERS, Gear, GearUsage, PersonalRecord
 from .parser.sleep import SleepRecord
 from .parser.training import TrainingDay
 from .stats import human_duration, human_pace
@@ -28,6 +29,17 @@ from .stats import human_duration, human_pace
 _ID_SALT = "garmaple-v1"
 
 VALID_LEVELS = ("strict", "normal", "raw")
+
+# 装备状态。实测归档里只出现 active；retired 是佳明另一端的取值，
+# 一起译好，免得换一份导出包就冒出一个没有中文的枚举。
+_GEAR_STATUS_LABELS = {"active": "使用中", "retired": "已退役"}
+
+
+def _distance_text(meters: float) -> str:
+    """距离的可读写法。小于 1 公里用米，否则用公里——21.12 km 比 21116 m 好读。"""
+    if meters >= 1000:
+        return f"{meters / 1000:.2f} km"
+    return f"{meters:.0f} m"
 
 
 def pseudo_activity_id(activity_id: int) -> str:
@@ -339,5 +351,112 @@ class Privacy:
 
         if self.allows_identity:
             out["user_profile_id"] = rec.user_profile_id
+
+        return self._strip_none(out)
+
+    def record(self, rec: PersonalRecord) -> dict[str, object]:
+        """一条个人最佳。
+
+        `value` 的量纲由 `unit` 说明，**不要跨类型比较**：同样是「最好的跑步」，
+        `Best 5km Run` 是秒而 `Farthest Run` 是米。`display` 是按量纲格式化过的
+        写法，转述给用户时直接用它，别自己拼单位。
+
+        计数与天数给整数，成绩与距离保留一位小数——成绩精确到 0.1 秒已经够用，
+        而 1108.3089599609375 这种原值读出来只会让人分心。
+
+        `date` 是达成日（本地）。步数与连续达标类没有这个字段：归档里它们只有
+        区间起点，拿它当达成日会读成「一天之内创下多项纪录」。
+        """
+        if rec.unit in (COUNT, DAYS):
+            value: float = float(int(round(rec.value)))
+        else:
+            value = round(rec.value, 1)
+
+        out: dict[str, object] = {
+            "type": rec.type,
+            "label": rec.label,
+            "group": rec.group,
+            "value": value,
+            "unit": rec.unit,
+            "display": self._record_display(rec),
+            "date": rec.date,
+            "current": rec.current,
+        }
+
+        if self.allows_identity:
+            out["user_profile_id"] = rec.user_profile_id
+
+        return self._strip_none(out)
+
+    def _record_display(self, rec: PersonalRecord) -> str | None:
+        unit = rec.unit
+        if unit == "s":
+            return human_duration(rec.value)
+        if unit == METERS:
+            return _distance_text(rec.value)
+        if unit == DAYS:
+            return f"{int(round(rec.value))} 天"
+        if unit == COUNT:
+            return f"{int(round(rec.value)):,}"
+        # 单位未知就给数值本身，不猜量纲
+        return f"{rec.value:g}"
+
+    def gear(self, gear: Gear, usage: GearUsage) -> dict[str, object]:
+        """一双装备的累计使用情况。
+
+        里程是**关联活动的距离之和**，不是设备给的累计值——归档里没有那个字段。
+        因此这里同时给出 `activity_count` 与按运动的明细：跑鞋的里程里会混进
+        步行记录（实测 268 次里有 5 次），只给一个总数没法解释。
+
+        没有关联记录时给 `note` 而不是 0 公里。实测确实有一双鞋整个关联键都
+        不存在，「跑了 0 公里」与「归档里没记」是两回事，混起来会得出
+        「这双鞋买了没穿过」这种并不成立的结论。
+
+        `remaining_km` 可能为负：它表示已超出设备里设置的建议里程，
+        是跑鞋超期服役的事实，不是数据错误，不要截成 0。
+
+        `id` 只在 normal / raw 下给。strict 下不给原始 gearPk——装备靠名称就能
+        认出来，不需要暴露内部主键。
+        """
+        out: dict[str, object] = {
+            "name": gear.name,
+            "type": gear.gear_type,
+            "status": gear.status,
+            "status_label": _GEAR_STATUS_LABELS.get(gear.status or "", None),
+            "started_on": gear.started_on,
+        }
+
+        if usage.has_activities and usage.distance_m is not None:
+            km = usage.distance_m / 1000.0
+            out["distance_km"] = round(km, 1)
+            out["activity_count"] = usage.activity_count
+            out["first_activity"] = usage.first_date
+            out["last_activity"] = usage.last_date
+            if gear.max_meters:
+                limit_km = gear.max_meters / 1000.0
+                out["life_limit_km"] = round(limit_km, 1)
+                out["remaining_km"] = round(limit_km - km, 1)
+                out["used_pct"] = round(km / limit_km * 100, 1)
+            out["by_sport"] = {
+                sport: {
+                    "count": item.count,
+                    "distance_km": round(item.distance_m / 1000.0, 1),
+                }
+                for sport, item in usage.by_sport.items()
+            }
+        else:
+            # 有建议里程却没关联记录时也要给出上限，否则这双鞋看上去像没有配置
+            if gear.max_meters:
+                out["life_limit_km"] = round(gear.max_meters / 1000.0, 1)
+            out["note"] = "归档里没有这双装备的关联活动记录，无法计算里程"
+
+        # 关联表里提到但活动摘要里没有的那几次：里程偏低的原因，得说出来
+        if usage.unmatched_count:
+            out["unmatched_links"] = usage.unmatched_count
+
+        if self.allows_raw_id:
+            out["id"] = str(gear.gear_id)
+        if self.allows_identity:
+            out["user_profile_id"] = gear.user_profile_id
 
         return self._strip_none(out)

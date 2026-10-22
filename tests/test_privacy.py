@@ -436,3 +436,162 @@ def test_vo2max_has_no_fitness_age_leak() -> None:
 def test_vo2max_user_profile_only_in_raw() -> None:
     assert "user_profile_id" not in Privacy("strict").vo2max(make_vo2max_record())
     assert Privacy("raw").vo2max(make_vo2max_record())["user_profile_id"] == 999
+
+
+# ---------- 个人最佳 ----------
+
+
+def make_record(**overrides: object):
+    from garmaple.parser.records import parse_record
+
+    from .test_records import make_raw as make_record_raw
+
+    rec = parse_record(make_record_raw(**overrides))
+    assert rec is not None
+    return rec
+
+
+def test_record_time_is_formatted_as_duration() -> None:
+    out = Privacy("strict").record(
+        make_record(recordType="Best 5km Run", value=1108.3)
+    )
+    assert out["unit"] == "s"
+    assert out["value"] == 1108.3
+    assert out["display"] == "18m28s"
+    assert out["label"] == "5 公里跑最快"
+
+
+def test_record_distance_is_formatted_as_km() -> None:
+    out = Privacy("strict").record(
+        make_record(recordType="Farthest Run", value=21116.36)
+    )
+    assert out["unit"] == "m"
+    assert out["value"] == 21116.4
+    assert out["display"] == "21.12 km"
+
+
+def test_record_count_is_whole_number() -> None:
+    """步数不能被写成 36434.0——那看起来像测量值而不是计数。"""
+    out = Privacy("strict").record(
+        make_record(recordType="Most Steps in a Day", value=36434.0, activityId=0)
+    )
+    assert out["value"] == 36434
+    assert isinstance(out["value"], float) or isinstance(out["value"], int)
+    assert out["display"] == "36,434"
+
+
+def test_record_streak_is_labelled_in_days() -> None:
+    out = Privacy("strict").record(
+        make_record(recordType="Longest Goal Streak", value=9, activityId=0)
+    )
+    assert out["display"] == "9 天"
+
+
+def test_record_without_date_omits_it() -> None:
+    """汇总类纪录没有达成日，不能给空串或建档日。"""
+    out = Privacy("strict").record(
+        make_record(recordType="Most Steps in a Month", value=392896, activityId=0)
+    )
+    assert "date" not in out
+
+
+def test_record_unknown_unit_keeps_raw_value() -> None:
+    out = Privacy("strict").record(make_record(recordType="Mystery Badge", value=3.5))
+    assert "unit" not in out
+    assert out["display"] == "3.5"
+    assert out["label"] == "Mystery Badge"
+
+
+def test_record_user_profile_only_in_raw() -> None:
+    assert "user_profile_id" not in Privacy("strict").record(make_record())
+    assert Privacy("raw").record(make_record())["user_profile_id"] == 999
+
+
+# ---------- 装备 ----------
+
+
+def make_gear_obj(*, activity_ids: list[int] | None = None, **overrides: object):
+    from garmaple.parser.records import parse_gear
+
+    from .test_records import make_gear
+
+    raw = make_gear(**overrides)
+    links = {
+        str(raw["gearPk"]): [
+            {"gearPk": raw["gearPk"], "activityId": a}
+            for a in (activity_ids or [])
+        ]
+    }
+    gear = parse_gear(raw, links)
+    assert gear is not None
+    return gear
+
+
+def usage_with(count: int, meters: float, **overrides: object):
+    from garmaple.parser.records import GearUsage, SportUsage
+
+    return GearUsage(
+        activity_count=count,
+        distance_m=meters,
+        first_date=overrides.get("first_date", "2025-02-21"),
+        last_date=overrides.get("last_date", "2026-10-21"),
+        assigned_count=overrides.get("assigned_count", count),
+        by_sport=overrides.get(
+            "by_sport", {"running": SportUsage(count=count, distance_m=meters)}
+        ),
+    )
+
+
+def test_gear_reports_mileage_and_remaining() -> None:
+    out = Privacy("strict").gear(make_gear_obj(), usage_with(268, 1_130_765.0))
+    assert out["distance_km"] == 1130.8
+    assert out["activity_count"] == 268
+    assert out["life_limit_km"] == 636.0
+    assert out["remaining_km"] == -494.8  # 已超出建议里程，是事实不是错误
+    assert out["used_pct"] == 177.8
+
+
+def test_gear_without_links_says_so_instead_of_zero() -> None:
+    """空关联必须说「没有记录」，给 0 公里会被读成「买了没穿过」。"""
+    from garmaple.parser.records import GearUsage
+
+    out = Privacy("strict").gear(make_gear_obj(), GearUsage())
+    assert "distance_km" not in out
+    assert "activity_count" not in out
+    assert "无法计算里程" in out["note"]
+
+
+def test_gear_mentions_unmatched_links() -> None:
+    """关联里提到但摘要里没有的那几次，要说明里程偏低的原因。"""
+    out = Privacy("strict").gear(
+        make_gear_obj(), usage_with(1, 10_000.0, assigned_count=2)
+    )
+    assert out["unmatched_links"] == 1
+
+
+def test_gear_by_sport_explains_walks_in_shoe_mileage() -> None:
+    from garmaple.parser.records import SportUsage
+
+    usage = usage_with(
+        268,
+        1_130_765.0,
+        by_sport={
+            "running": SportUsage(count=263, distance_m=1_119_600.0),
+            "steps": SportUsage(count=5, distance_m=11_165.0),
+        },
+    )
+    out = Privacy("strict").gear(make_gear_obj(), usage)
+    assert set(out["by_sport"]) == {"running", "steps"}
+    assert out["by_sport"]["steps"]["distance_km"] == 11.2
+
+
+def test_gear_id_hidden_in_strict() -> None:
+    usage = usage_with(1, 1000.0)
+    assert "id" not in Privacy("strict").gear(make_gear_obj(), usage)
+    assert Privacy("normal").gear(make_gear_obj(), usage)["id"] == "700001"
+
+
+def test_gear_status_is_labelled() -> None:
+    out = Privacy("strict").gear(make_gear_obj(), usage_with(1, 1000.0))
+    assert out["status"] == "active"
+    assert out["status_label"] == "使用中"
