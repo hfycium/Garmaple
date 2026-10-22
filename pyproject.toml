@@ -37,3 +37,6 @@ include = ["garmaple*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 本机 TEMP 指向不可写目录时 pytest 会报 PermissionError，
+# 固定使用项目内目录，跨平台行为一致（已在 .gitignore 中排除）
+addopts = "--basetemp=.pytest_tmp"
