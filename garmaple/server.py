@@ -12,7 +12,7 @@ from typing import Any
 from .config import Config
 from .privacy import Privacy
 from .stats import human_duration, human_pace, summarize
-from .store import Store, row_to_activity
+from .store import Store, row_to_activity, row_to_daily
 
 INSTRUCTIONS = """\
 本服务读取用户本地的佳明（Garmin）导出数据，不联网、不上传。
@@ -24,6 +24,10 @@ INSTRUCTIONS = """\
 隐私：默认 strict 级别下不提供 GPS 坐标与地点名称，活动 ID 是伪 ID。
 不要试图推测用户住址或作息规律。若用户需要更细的数据，请提示其
 自行调整 GARMAPLE_PRIVACY 配置，而不是尝试绕过限制。
+
+当前索引包含：活动摘要，以及每日 wellness 汇总（步数、静息心率、压力、
+身体电量、强度分钟）。尚未支持睡眠、训练负荷、逐秒采样等数据——
+被问到时直接说明当前版本没有这项能力，不要猜测数值。
 """
 
 
@@ -62,7 +66,7 @@ def build_server(cfg: Config) -> Any:
         with _store() as store:
             total = store.count_activities()
             lo, hi = store.date_range()
-            return {
+            result = {
                 "activities": total,
                 "date_from": lo,
                 "date_to": hi,
@@ -71,6 +75,16 @@ def build_server(cfg: Config) -> Any:
                 "privacy_level": privacy.level,
                 "note": "本地导出归档，不含最近一次导出之后的数据",
             }
+            # 每日汇总可能为空（旧索引，或导出包里没有 UDS 文件），单独给出覆盖范围
+            day_count = store.count_days()
+            if day_count:
+                dlo, dhi = store.day_range()
+                result["daily_summary"] = {
+                    "days": day_count,
+                    "date_from": dlo,
+                    "date_to": dhi,
+                }
+            return result
 
     @mcp.tool()
     def list_activities(
@@ -141,6 +155,61 @@ def build_server(cfg: Config) -> Any:
                 result["sport_filter"] = sport
             if not rows:
                 result["hint"] = "该区间没有记录，可先用 get_data_overview 确认数据覆盖范围"
+            return result
+
+    @mcp.tool()
+    def get_daily_summary(
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: int = 31,
+    ) -> dict[str, Any]:
+        """查看每日 wellness 汇总：步数、静息心率、压力、身体电量、强度分钟。
+
+        与活动工具互补：活动记录只覆盖练过的日子，日汇总覆盖戴表的日子，
+        因此「某天没有训练」用它可以区分「休息」与「没戴表」。
+
+        参数：
+            start_date / end_date: YYYY-MM-DD，含端点，均可省略；
+                两者都省略时返回最近 limit 天
+            limit: 最多返回天数，默认 31，上限 120；区间结果超长时只保留最近的部分
+
+        结果按日期正序（便于看趋势）。缺记录的日子直接跳过，
+        不补零——补零会把「没戴表」说成「走了 0 步」。
+        """
+        capped = max(1, min(int(limit or 31), 120))
+        start = _date(start_date, "start_date")
+        end = _date(end_date, "end_date")
+        if start and end and start > end:
+            raise ValueError("start_date 不能晚于 end_date")
+
+        with _store() as store:
+            if start is None and end is None:
+                rows = store.query_days(limit=capped, order="desc")
+                truncated = False
+            else:
+                rows = store.query_days(start=start, end=end, order="asc")
+                truncated = len(rows) > capped
+                if truncated:
+                    # 超长时留最近的，而不是最早的——用户问的通常是「最近」
+                    rows = rows[-capped:]
+
+            days = [privacy.day(row_to_daily(r)) for r in rows]
+            if not days:
+                return {
+                    "count": 0,
+                    "days": [],
+                    "hint": "该区间没有每日汇总。可用 get_data_overview 确认数据覆盖范围；"
+                            "若索引早于本次升级，请重新运行 garmaple index。",
+                }
+
+            result: dict[str, Any] = {
+                "count": len(days),
+                "range": {"from": days[0]["date"], "to": days[-1]["date"]},
+                "days": days,
+            }
+            if truncated:
+                result["truncated"] = True
+                result["note"] = f"区间内记录多于 {capped} 天，只返回最近 {capped} 天"
             return result
 
     return mcp
