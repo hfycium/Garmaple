@@ -457,3 +457,119 @@ def test_old_days_table_without_offset_self_heals(tmp_path: Path) -> None:
         cols = {r[1] for r in s._conn.execute("PRAGMA table_info(days)")}
         assert "utc_offset_hours" in cols
         assert s.count_days() == 0
+
+
+# ---------------- training 表 ----------------
+
+def train(calendar_date: str, **overrides: object):
+    from garmaple.parser.training import parse_training
+
+    from .test_training import make_block
+
+    rec = parse_training(make_block(calendarDate=calendar_date, **overrides))
+    assert rec is not None
+    return rec
+
+
+def test_training_upsert_and_count(tmp_path: Path) -> None:
+    with Store(tmp_path / "t.sqlite3") as s:
+        assert s.upsert_training(
+            [train("2025-04-23"), train("2025-04-24")], source="x"
+        ) == 2
+        assert s.count_training() == 2
+
+
+def test_training_upsert_is_idempotent(tmp_path: Path) -> None:
+    with Store(tmp_path / "t.sqlite3") as s:
+        s.upsert_training([train("2025-04-23")], source="x")
+        s.upsert_training([train("2025-04-23", trainingStatus="RECOVERY")], source="x")
+        assert s.count_training() == 1
+        assert s.query_training()[0]["status"] == "RECOVERY"
+
+
+def test_training_date_range_is_inclusive(tmp_path: Path) -> None:
+    with Store(tmp_path / "t.sqlite3") as s:
+        s.upsert_training(
+            [train("2025-04-23"), train("2025-04-24"), train("2025-04-25")], source="x"
+        )
+        rows = s.query_training(start="2025-04-24", end="2025-04-25")
+        assert [r["date"] for r in rows] == ["2025-04-24", "2025-04-25"]
+        assert s.query_training(start="2099-01-01") == []
+
+
+def test_training_limit_desc_returns_most_recent_in_order(tmp_path: Path) -> None:
+    with Store(tmp_path / "t.sqlite3") as s:
+        s.upsert_training(
+            [train("2025-04-22"), train("2025-04-23"),
+             train("2025-04-24"), train("2025-04-25")], source="x"
+        )
+        assert [r["date"] for r in s.query_training(limit=2, order="desc")] == [
+            "2025-04-24", "2025-04-25",
+        ]
+
+
+def test_training_range(tmp_path: Path) -> None:
+    with Store(tmp_path / "t.sqlite3") as s:
+        assert s.training_range() == (None, None)
+        s.upsert_training([train("2025-04-23"), train("2025-04-25")], source="x")
+        assert s.training_range() == ("2025-04-23", "2025-04-25")
+
+
+def test_training_roundtrip_keeps_zero_load(tmp_path: Path) -> None:
+    """周负荷 0 往返一趟仍是 0，不能变成 NULL。"""
+    from garmaple.store import row_to_training
+
+    with Store(tmp_path / "t.sqlite3") as s:
+        s.upsert_training([train("2025-04-23", weeklyTrainingLoadSum=0)], source="x")
+        restored = row_to_training(s.query_training()[0])
+    assert restored.weekly_load == 0
+    assert restored.load_position == "below"
+
+
+def test_training_roundtrip_keeps_tunnel_and_trends(tmp_path: Path) -> None:
+    from datetime import datetime
+
+    from garmaple.store import row_to_training
+
+    with Store(tmp_path / "t.sqlite3") as s:
+        s.upsert_training([train("2025-04-23")], source="x")
+        restored = row_to_training(s.query_training()[0])
+    assert restored.tunnel_min == 281
+    assert restored.tunnel_max == 640
+    assert restored.load_position == "in"
+    assert restored.fitness_trend == "NO_CHANGE"
+    assert restored.load_trend == "INCREASING"
+    assert restored.updated_at == datetime(2025, 4, 22, 16, 1, 57)
+
+
+def test_four_tables_coexist(tmp_path: Path) -> None:
+    with Store(tmp_path / "s.sqlite3") as s:
+        s.upsert_activities([act(1)], source="x")
+        s.upsert_days([day("2025-04-23")], source="x")
+        s.upsert_sleeps([sleep("2025-04-23")], source="x")
+        s.upsert_training([train("2025-04-23")], source="x")
+        assert (
+            s.count_activities(), s.count_days(),
+            s.count_sleeps(), s.count_training(),
+        ) == (1, 1, 1, 1)
+
+
+def test_broken_training_table_self_heals(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "old-training.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE training (date TEXT PRIMARY KEY, status TEXT);
+        INSERT INTO training VALUES ('2025-04-23', 'PRODUCTIVE');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as s:
+        cols = {r[1] for r in s._conn.execute("PRAGMA table_info(training)")}
+        assert "weekly_load" in cols
+        assert s.count_training() == 0  # 旧表被丢弃，等下次 index 重灌
+        assert s.upsert_training([train("2025-04-23")], source="x") == 1

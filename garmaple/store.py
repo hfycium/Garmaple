@@ -19,9 +19,10 @@ from typing import Iterable
 from .parser.activities import Activity
 from .parser.daily import DailyStat
 from .parser.sleep import STATUS_OK, SleepRecord
+from .parser.training import TrainingDay
 from .privacy import pseudo_activity_id
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _META_SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -155,6 +156,31 @@ _SLEEP_COLUMNS = (
     "deep_min", "light_min", "rem_min", "awake_min", "unmeasured_min",
     "respiration_avg", "respiration_low", "respiration_high",
     "status", "retro", "source",
+)
+
+# 训练状态。主键同样是日历日，口径也是本地日（`calendarDate` 本身即本地）。
+# load_position（在隧道内 / 低于 / 高于）不入库——它由 weekly_load 与隧道边界
+# 推出来，和 sleeps.asleep_min 同理，存一份等于留两份真相。
+_TRAINING_SCHEMA = """
+CREATE TABLE IF NOT EXISTS training (
+    date            TEXT PRIMARY KEY,
+    status          TEXT NOT NULL,
+    weekly_load     INTEGER,
+    tunnel_min      INTEGER,
+    tunnel_max      INTEGER,
+    fitness_trend   TEXT,
+    load_trend      TEXT,
+    sport           TEXT,
+    updated_at      TEXT,
+    user_profile_id INTEGER,
+    source          TEXT
+);
+"""
+
+_TRAINING_COLUMNS = (
+    "date", "status", "weekly_load", "tunnel_min", "tunnel_max",
+    "fitness_trend", "load_trend", "sport", "updated_at",
+    "user_profile_id", "source",
 )
 
 _COLUMNS = (
@@ -331,6 +357,33 @@ def row_to_sleep(row: sqlite3.Row) -> SleepRecord:
     return rec
 
 
+def _training_tuple(rec: TrainingDay, source: str) -> tuple[object, ...]:
+    return (
+        rec.date, rec.status, rec.weekly_load, rec.tunnel_min, rec.tunnel_max,
+        rec.fitness_trend, rec.load_trend, rec.sport, _iso(rec.updated_at),
+        rec.user_profile_id, source,
+    )
+
+
+def row_to_training(row: sqlite3.Row) -> TrainingDay:
+    """把 training 表的行还原成 TrainingDay，供 privacy 层统一格式化。
+
+    `status_label` / `load_position` 都是属性，不在这里补——派生值只留一处实现。
+    """
+    return TrainingDay(
+        date=row["date"],
+        status=row["status"],
+        weekly_load=row["weekly_load"],
+        tunnel_min=row["tunnel_min"],
+        tunnel_max=row["tunnel_max"],
+        fitness_trend=row["fitness_trend"],
+        load_trend=row["load_trend"],
+        sport=row["sport"],
+        updated_at=_parse_dt(row["updated_at"]),
+        user_profile_id=row["user_profile_id"],
+    )
+
+
 class Store:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -342,6 +395,7 @@ class Store:
         self._conn.executescript(_SCHEMA)
         self._conn.executescript(_DAYS_SCHEMA)
         self._conn.executescript(_SLEEPS_SCHEMA)
+        self._conn.executescript(_TRAINING_SCHEMA)
         self._conn.commit()
 
     # 结构自愈的判据：每张表缺了这些列就视为旧表
@@ -349,6 +403,7 @@ class Store:
         "activities": frozenset({"pseudo_id", "sport", "date", "distance_m"}),
         "days": frozenset({"date", "steps", "resting_hr", "stress_avg", "utc_offset_hours"}),
         "sleeps": frozenset({"date", "in_bed_min", "status", "deep_min"}),
+        "training": frozenset({"date", "status", "weekly_load", "tunnel_min"}),
     }
 
     def _migrate(self) -> None:
@@ -426,6 +481,21 @@ class Store:
             self._conn.executemany(sql, rows)
         return len(rows)
 
+    def upsert_training(self, records: Iterable[TrainingDay], source: str) -> int:
+        """幂等写入训练状态，返回写入的行数。"""
+        placeholders = ", ".join("?" * len(_TRAINING_COLUMNS))
+        sql = (
+            f"INSERT INTO training ({', '.join(_TRAINING_COLUMNS)}) VALUES ({placeholders}) "
+            "ON CONFLICT(date) DO UPDATE SET "
+            + ", ".join(f"{c}=excluded.{c}" for c in _TRAINING_COLUMNS if c != "date")
+        )
+        rows = [_training_tuple(r, source) for r in records]
+        if not rows:
+            return 0
+        with self._conn:
+            self._conn.executemany(sql, rows)
+        return len(rows)
+
     def set_meta(self, key: str, value: str) -> None:
         with self._conn:
             self._conn.execute(
@@ -448,6 +518,9 @@ class Store:
 
     def count_sleeps(self) -> int:
         return self._conn.execute("SELECT COUNT(*) AS n FROM sleeps").fetchone()["n"]
+
+    def count_training(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) AS n FROM training").fetchone()["n"]
 
     def _query_by_date(
         self,
@@ -505,6 +578,16 @@ class Store:
         """按日期区间取睡眠记录。日期口径是本地**醒来日**。"""
         return self._query_by_date("sleeps", start, end, limit, order)
 
+    def query_training(
+        self,
+        start: str | date | None = None,
+        end: str | date | None = None,
+        limit: int | None = None,
+        order: str = "asc",
+    ) -> list[sqlite3.Row]:
+        """按日期区间取训练状态。一天至多一行（同日多快照已在解析层去掉）。"""
+        return self._query_by_date("training", start, end, limit, order)
+
     def day_range(self) -> tuple[str | None, str | None]:
         row = self._conn.execute(
             "SELECT MIN(date) AS lo, MAX(date) AS hi FROM days"
@@ -514,6 +597,12 @@ class Store:
     def sleep_range(self) -> tuple[str | None, str | None]:
         row = self._conn.execute(
             "SELECT MIN(date) AS lo, MAX(date) AS hi FROM sleeps"
+        ).fetchone()
+        return (row["lo"], row["hi"]) if row else (None, None)
+
+    def training_range(self) -> tuple[str | None, str | None]:
+        row = self._conn.execute(
+            "SELECT MIN(date) AS lo, MAX(date) AS hi FROM training"
         ).fetchone()
         return (row["lo"], row["hi"]) if row else (None, None)
 
