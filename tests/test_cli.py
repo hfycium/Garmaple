@@ -43,12 +43,16 @@ def build_archive(
     vo2max: int | None = None,
     personal: int | None = None,
     gears: int | None = None,
+    superseded: bool = False,
 ) -> Path:
     """造一个最小导出包：活动 + 日汇总 + 睡眠 + 训练 + 预测 + 摄氧量 + 纪录 + 装备。
 
     `sleeps` / `training` / `races` / `vo2max` 为 None 时与 `days` 同天数；
     `personal` / `gears` 为 None 时各写 2 条。显式传 0 则不写对应分片，
     用于验证「缺这份数据也能正常索引」。
+
+    `superseded=True` 时额外写一条被刷新过的旧纪录（current=false），
+    用于验证「当前纪录」与「历史纪录」不会混在一起。
     """
     path = root / "export.zip"
     payload = [{"summarizedActivitiesExport": [
@@ -106,20 +110,25 @@ def build_archive(
         for i in range(vo2_count)
     ]
     personal_count = 2 if personal is None else personal
-    personal_block = [
-        {
-            "personalRecords": [
-                make_record(
-                    recordId=900001, recordType="Best 5km Run", value=1108.3,
-                    activityId=1000, created="2026-07-20",
-                ),
-                make_record(
-                    recordId=900002, recordType="Farthest Run", value=21116.4,
-                    activityId=1001, created="2026-07-21",
-                ),
-            ][:personal_count]
-        }
-    ]
+    personal_items = [
+        make_record(
+            recordId=900001, recordType="Best 5km Run", value=1108.3,
+            activityId=1000, created="2026-07-20",
+        ),
+        make_record(
+            recordId=900002, recordType="Farthest Run", value=21116.4,
+            activityId=1001, created="2026-07-21",
+        ),
+    ][:personal_count]
+    if superseded:
+        # 同类型的旧成绩：已经被上面那条 5K 刷新掉了
+        personal_items.append(
+            make_record(
+                recordId=900003, recordType="Best 5km Run", value=1194.2,
+                activityId=1000, created="2026-07-20", current=False,
+            )
+        )
+    personal_block = [{"personalRecords": personal_items}]
     gear_count = 2 if gears is None else gears
     # 一双有关联、一双没有——复刻实测情形：有装备的关联键整个不存在
     gear_block = make_gear_payload(

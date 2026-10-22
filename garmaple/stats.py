@@ -10,14 +10,22 @@ from collections import Counter
 from typing import Any, Iterable, Mapping
 
 
-def human_duration(seconds: float | None) -> str | None:
+def human_duration(seconds: float | None, *, precise: bool = False) -> str | None:
+    """秒数转可读时长。
+
+    `precise=False`（默认）在超过 1 小时时省掉秒：活动时长与睡眠时长说
+    「1h54m」就够，多给的秒只是噪音。
+
+    `precise=True` 一律带秒。个人最佳必须这样——1h54m14s 与 1h54m52s
+    是两条不同的纪录，省掉秒会让它们看起来完全一样。
+    """
     if not seconds:
         return None
     total = int(round(seconds))
     h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
     if h:
-        return f"{h}h{m:02d}m"
+        return f"{h}h{m:02d}m{s:02d}s" if precise else f"{h}h{m:02d}m"
     if m:
         return f"{m}m{s:02d}s"
     return f"{s}s"

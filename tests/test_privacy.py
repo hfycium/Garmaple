@@ -461,6 +461,30 @@ def test_record_time_is_formatted_as_duration() -> None:
     assert out["label"] == "5 公里跑最快"
 
 
+def test_record_long_time_keeps_seconds() -> None:
+    """超过 1 小时的成绩必须带秒。
+
+    1h54m14s 与 1h54m52s 差 38 秒，省略秒之后两条不同的纪录看起来完全一样。
+    活动时长与睡眠时长不带秒是对的，个人最佳不行。
+    """
+    out = Privacy("strict").record(
+        make_record(recordType="Best Half Marathon", value=6854.0)
+    )
+    assert out["display"] == "1h54m14s"
+
+
+def test_record_elevation_stays_in_meters() -> None:
+    """爬升用米，不能走距离格式化。
+
+    1350 米爬升若写成 1.35 km，量纲没错但会被读成「爬升了一公里多的坡」。
+    """
+    out = Privacy("strict").record(
+        make_record(recordType="Max Elevation Gain", value=1350.7)
+    )
+    assert out["unit"] == "m"
+    assert out["display"] == "1,351 m"
+
+
 def test_record_distance_is_formatted_as_km() -> None:
     out = Privacy("strict").record(
         make_record(recordType="Farthest Run", value=21116.36)

@@ -12,12 +12,15 @@ from typing import Any
 
 from .config import Config
 from .parser.metrics import RACE_DISTANCES_KM
+from .parser.records import GROUPS, GearUsage
 from .privacy import Privacy
 from .stats import human_duration, human_pace, summarize
 from .store import (
     Store,
     row_to_activity,
     row_to_daily,
+    row_to_gear,
+    row_to_personal,
     row_to_race,
     row_to_sleep,
     row_to_training,
@@ -38,19 +41,24 @@ INSTRUCTIONS = """\
 当前索引包含：活动摘要、每日 wellness 汇总（步数、静息心率、压力、
 身体电量、强度分钟）、睡眠（时长与分期）、训练状态（状态判定、
 周训练负荷、负荷隧道）、比赛成绩预测（5K / 10K / 半马 / 全马）、
-最大摄氧量。
+最大摄氧量、个人最佳纪录、装备里程。
 
-四点必须注意：
+六点必须注意：
 - 睡眠记录按**醒来日**归档。问「昨晚睡得怎么样」要查今天那条，
   查昨天会拿到前一晚的数据。
 - 官方导出包里没有睡眠评分数值，也没有 CTL / ATL / TSB 三个体能指标，
   也没有逐秒采样。训练状态与周训练负荷是设备自己判定的结果，
   与 Connect 上显示的一致，但不要把它当成 CTL 用，也不要自行换算。
   被问到时直接说明当前没有这项能力，不要猜测或估算数值。
-- 比赛预测是设备按当前体能**推算**的完赛时间，不是已经跑出来的成绩，
-  两者不要混着说。
+- 比赛预测是设备按当前体能**推算**的完赛时间，不是已经跑出来的成绩；
+  个人最佳里的 5K / 10K / 半马纪录才是实际达成的。两者不要混着说。
 - 最大摄氧量只在设备测出有效数据的日子才有记录，日期很稀疏，
   不要按天插值，也不要把缺记录说成数值下降。
+- 个人最佳的 `value` 量纲随类型变：成绩是**秒**、距离是**米**、
+  步数是**次数**、连续达标是**天**。转述时必须带上 `unit` 或直接用
+  `display`，否则会把 1108 秒的 5K 说成 1108 米。
+- 装备里程是由关联活动的距离求和得到的。某双装备没有关联记录
+  只代表**归档里没记**，不等于没跑过，不要报 0 公里。
 """
 
 
@@ -171,6 +179,22 @@ def build_server(cfg: Config) -> Any:
                     "date_from": vlo,
                     "date_to": vhi,
                     "note": "只在测出有效数据的日子有记录，日期稀疏",
+                }
+            record_count = store.count_personal_records()
+            if record_count:
+                rows = store.query_personal_records()
+                result["personal_records"] = {
+                    "total": record_count,
+                    "current": sum(1 for r in rows if r["current"]),
+                    "note": "设备认定的个人最佳；value 量纲随类型变，见 unit 字段",
+                }
+            gear_count = store.count_gears()
+            if gear_count:
+                usage = store.gear_usage()
+                result["gear"] = {
+                    "items": gear_count,
+                    "with_activities": sum(1 for u in usage.values() if u.has_activities),
+                    "note": "里程由关联活动求和；没有关联记录不等于没跑过",
                 }
             return result
 
@@ -606,6 +630,163 @@ def build_server(cfg: Config) -> Any:
                 result["truncated"] = True
                 result["note"] = f"区间内记录多于 {capped} 条，只返回最近 {capped} 条"
             return result
+
+    @mcp.tool()
+    def get_personal_records(group: str | None = None) -> dict[str, Any]:
+        """查看设备认定的个人最佳纪录：跑、游、骑的最好成绩与最大量。
+
+        这些是**实际达成**的成绩，与 `get_race_predictions` 的推算值不是一回事，
+        回答「我 5K 最好成绩」用它，回答「我 5K 能跑多少」用预测。
+
+        最重要的坑：`value` 的量纲随类型变化，同一个字段四种单位。
+            s      成绩，秒            Best 5km Run = 1108.3
+            m      距离，米            Farthest Run = 21116.4
+            count  计数，次数          Most Steps in a Day = 36434
+            day    连续天数            Longest Goal Streak = 9
+        转述时必须看 `unit`，或者直接用 `display`（已按量纲格式化）。
+        把 1108 秒当成距离，就会说出「5 公里跑了 1108 米」。
+
+        结果结构：
+            count        当前有效纪录条数
+            groups       按运动分组：run / swim / cycle / general
+            group_counts 每组的条数
+            superseded   被刷新过的旧纪录（含 date 与 value）
+            unit_note    上述单位说明，原样引用即可
+
+        两点边界：
+        - 步数与连续达标类**没有 date**：归档里它们只有区间起点，
+          拿它当达成日会读成「一天之内创下多项纪录」。
+        - `superseded` 里的纪录已经被当前纪录取代，是进步的证据，
+          不是并列成绩，不要说成「有两个 5K 最好成绩」。
+
+        参数：
+            group  只看某一组，取 run / swim / cycle / general，省略则全给
+
+        归档里没有的类型（例如全马最佳）就是没有记录过——本工具不推算、
+        不用预测值顶替。被问到没有的类型时说明归档里没有，不要拿预测值冒充。
+        """
+        wanted: str | None = None
+        if group is not None and str(group).strip():
+            wanted = str(group).strip().lower()
+            if wanted not in GROUPS:
+                raise ToolError(
+                    f"group 需为 {', '.join(GROUPS)} 之一，收到 {group!r}"
+                )
+
+        with _store() as store:
+            rows = store.query_personal_records()
+            if not rows:
+                return {
+                    "count": 0,
+                    "groups": {},
+                    "hint": "索引里没有个人最佳记录。可用 get_data_overview 确认覆盖范围；"
+                            "若索引早于本次升级，请重新运行 garmaple index。",
+                }
+            records = [privacy.record(row_to_personal(r)) for r in rows]
+
+        current = [r for r in records if r.get("current")]
+        superseded = [r for r in records if not r.get("current")]
+        if wanted:
+            current = [r for r in current if r["group"] == wanted]
+            superseded = [r for r in superseded if r["group"] == wanted]
+            if not current and not superseded:
+                return {
+                    "count": 0,
+                    "groups": {},
+                    "hint": f"归档里没有 {wanted} 组的纪录。"
+                            f"可选分组：{', '.join(GROUPS)}",
+                }
+
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for rec in current:
+            groups.setdefault(rec["group"], []).append(rec)
+
+        result: dict[str, Any] = {
+            "count": len(current),
+            "groups": groups,
+            "group_counts": {k: len(v) for k, v in groups.items()},
+            "unit_note": "value 的量纲由 unit 说明：s=秒、m=米、count=次数、day=天；"
+                         "display 是格式化后的写法，可直接转述",
+        }
+        if superseded:
+            result["superseded"] = superseded
+            result["superseded_note"] = (
+                "这些是被刷新过的旧纪录，已被上面的当前纪录取代；"
+                "可以用来对比进步，不是并列成绩"
+            )
+        if any("date" not in r for r in current):
+            result["date_note"] = (
+                "步数与连续达标类没有 date：归档里它们只有区间起点，"
+                "不是达成日"
+            )
+        return result
+
+    @mcp.tool()
+    def get_gear_mileage(include_inactive: bool = False) -> dict[str, Any]:
+        """查看装备（跑鞋等）的累计里程与寿命使用比例。
+
+        里程口径：**关联活动的距离之和**。归档里装备本身没有累计里程字段，
+        所以这个数是本工具从活动表加出来的，与 Connect 上显示的可能有差异
+        （差别通常来自没关联到装备的活动）。
+
+        每双装备给出：
+            distance_km     累计里程
+            activity_count  参与计算的活动次数
+            first_activity / last_activity  首次与最后一次的日期
+            life_limit_km   设备里设置的建议里程上限（用户自己填的）
+            remaining_km    上限减去已跑；**为负表示已超出**，是超期服役的事实，
+                            不是数据错误，不要截成 0，也不要据此说「数据异常」
+            used_pct        已用掉上限的百分比
+            by_sport        按运动的明细：跑鞋的里程里会混进步行记录，
+                            只给总数就没法解释「为什么比我自己记的多」
+
+        重要：`activity_count` 缺失或为 0 时，返回的是 `note` 而不是 0 公里。
+        那表示**归档里没有这双装备的关联记录**，可能没同步过、也可能本来就没记，
+        不等于「买了没穿过」。被问到时就按 note 的说法讲。
+
+        参数：
+            include_inactive  是否包含非使用中（已退役）的装备，默认只看使用中的
+        """
+        with _store() as store:
+            rows = store.query_gears()
+            if not rows:
+                return {
+                    "count": 0,
+                    "gears": [],
+                    "hint": "索引里没有装备记录。可用 get_data_overview 确认覆盖范围；"
+                            "若索引早于本次升级，请重新运行 garmaple index。",
+                }
+            usage = store.gear_usage()
+            rows_usage = {r["gear_id"]: usage.get(r["gear_id"], GearUsage()) for r in rows}
+            gears = [
+                privacy.gear(row_to_gear(r), rows_usage[r["gear_id"]]) for r in rows
+            ]
+
+        excluded = 0
+        if not include_inactive:
+            kept = [
+                g for g in gears
+                if g.get("status") in (None, "active")
+            ]
+            excluded = len(gears) - len(kept)
+            gears = kept
+
+        result: dict[str, Any] = {
+            "count": len(gears),
+            "gears": gears,
+            "mileage_note": "里程为关联活动的距离之和，不是设备直接给的累计值",
+        }
+        if excluded:
+            result["excluded_inactive"] = excluded
+            result["excluded_note"] = (
+                "已排除非使用中的装备；要看全部请传 include_inactive=true"
+            )
+        if any("note" in g for g in gears):
+            result["missing_note"] = (
+                "带 note 的装备在归档里没有关联活动记录，因此没有里程可算；"
+                "这不等于没跑过"
+            )
+        return result
 
     return mcp
 

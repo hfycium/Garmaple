@@ -20,7 +20,18 @@ from datetime import datetime
 from .parser.activities import Activity
 from .parser.daily import DailyStat
 from .parser.metrics import RACE_DISTANCES_KM, RacePrediction, Vo2maxSample
-from .parser.records import COUNT, DAYS, METERS, Gear, GearUsage, PersonalRecord
+from .parser.records import (
+    COUNT,
+    DAYS,
+    METERS,
+    METRIC_DISTANCE,
+    METRIC_DURATION,
+    METRIC_ELEVATION,
+    SECONDS,
+    Gear,
+    GearUsage,
+    PersonalRecord,
+)
 from .parser.sleep import SleepRecord
 from .parser.training import TrainingDay
 from .stats import human_duration, human_pace
@@ -40,6 +51,15 @@ def _distance_text(meters: float) -> str:
     if meters >= 1000:
         return f"{meters / 1000:.2f} km"
     return f"{meters:.0f} m"
+
+
+def _elevation_text(meters: float) -> str:
+    """爬升量的可读写法，一律用米。
+
+    不能走 `_distance_text`：爬升 1350 米写成 1.35 km 会被读成
+    「爬升了一公里多的坡」，量纲对但直觉反了。爬升本来就用米说。
+    """
+    return f"{meters:,.0f} m"
 
 
 def pseudo_activity_id(activity_id: int) -> str:
@@ -389,9 +409,20 @@ class Privacy:
         return self._strip_none(out)
 
     def _record_display(self, rec: PersonalRecord) -> str | None:
+        """按 `metric` 而不是 `unit` 选格式。
+
+        只用 `unit` 分不出「水平距离」与「爬升」——两者的 `unit` 都是米，
+        但爬升 1350 米写成 1.35 km 会被读成「爬升了一公里多的坡」，
+        而距离 21116 米写成 21.12 km 才是正常的。所以按 metric 分三支。
+        """
         unit = rec.unit
-        if unit == "s":
-            return human_duration(rec.value)
+        metric = rec.metric
+        if unit == SECONDS or metric == METRIC_DURATION:
+            # 个人最佳要秒：1h54m14s 与 1h54m52s 是两条不同的纪录，
+            # 省略秒会让它们看起来一样。
+            return human_duration(rec.value, precise=True)
+        if metric == METRIC_ELEVATION:
+            return _elevation_text(rec.value)
         if unit == METERS:
             return _distance_text(rec.value)
         if unit == DAYS:

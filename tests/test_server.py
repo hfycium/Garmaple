@@ -23,7 +23,7 @@ from .test_cli import build_archive
 
 def prepared(tmp_path: Path, days: int = 3, privacy: str = "strict") -> Config:
     data = tmp_path / "data"
-    data.mkdir()
+    data.mkdir(parents=True, exist_ok=True)
     build_archive(data, activities=2, days=days)
     cfg = Config(data_dir=data, cache_dir=tmp_path / "cache", privacy=privacy)
     main(["--data", str(cfg.data_dir), "--cache", str(cfg.cache_dir), "index"])
@@ -46,7 +46,9 @@ def test_daily_summary_tool_is_registered(tmp_path: Path) -> None:
     assert "get_training_status" in names
     assert "get_race_predictions" in names
     assert "get_vo2max_trend" in names
-    assert len(names) == 9
+    assert "get_personal_records" in names
+    assert "get_gear_mileage" in names
+    assert len(names) == 11
 
 
 def test_daily_summary_defaults_to_recent_days_in_order(tmp_path: Path) -> None:
@@ -464,6 +466,107 @@ def test_overview_reports_vo2max_coverage(tmp_path: Path) -> None:
     assert "稀疏" in out["vo2max"]["note"]
 
 
+# ---------------- get_personal_records ----------------
+
+
+def test_personal_records_group_by_sport(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_personal_records", {})
+    assert out["count"] == 2
+    assert set(out["groups"]) == {"run"}
+    assert out["group_counts"] == {"run": 2}
+
+
+def test_personal_records_keep_units_apart(tmp_path: Path) -> None:
+    """5K 是秒、Farthest Run 是米——同组不同类型，量纲不能混。
+
+    把 1108 秒当成距离，就会说出「5 公里跑了 1108 米」。
+    """
+    out = call(prepared(tmp_path), "get_personal_records", {})
+    by_type = {r["type"]: r for r in out["groups"]["run"]}
+    five = by_type["Best 5km Run"]
+    farthest = by_type["Farthest Run"]
+    assert five["unit"] == "s"
+    assert five["display"] == "18m28s"
+    assert farthest["unit"] == "m"
+    assert farthest["display"] == "21.12 km"
+
+
+def test_personal_records_superseded_is_flagged(tmp_path: Path) -> None:
+    """被刷新的旧纪录要单独分组说明，不能与当前纪录并列。"""
+    data = tmp_path / "data"
+    data.mkdir()
+    build_archive(data, days=3, superseded=True)
+    cfg = Config(data_dir=data, cache_dir=tmp_path / "cache", privacy="strict")
+    main(["--data", str(cfg.data_dir), "--cache", str(cfg.cache_dir), "index"])
+
+    out = call(cfg, "get_personal_records", {})
+    assert out["count"] == 2
+    assert len(out["superseded"]) == 1
+    assert out["superseded"][0]["value"] == 1194.2
+    assert out["superseded"][0]["current"] is False
+    assert "旧纪录" in out["superseded_note"]
+
+
+def test_personal_records_filter_by_group(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_personal_records", {"group": "swim"})
+    assert out["count"] == 0
+    assert "没有 swim" in out["hint"]
+
+
+def test_personal_records_unknown_group_is_tool_error(tmp_path: Path) -> None:
+    with pytest.raises(ToolError) as excinfo:
+        call(prepared(tmp_path), "get_personal_records", {"group": "yoga"})
+    assert not isinstance(excinfo.value, UnexpectedToolError)
+    assert "run" in str(excinfo.value)
+
+
+def test_overview_reports_personal_records(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_data_overview")
+    assert out["personal_records"]["total"] == 2
+    assert out["personal_records"]["current"] == 2
+
+
+# ---------------- get_gear_mileage ----------------
+
+
+def test_gear_mileage_sums_linked_activities(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_gear_mileage", {})
+    assert out["count"] == 2
+    first = out["gears"][0]
+    assert first["distance_km"] == 20.0  # 两条 10km 的活动
+    assert first["activity_count"] == 2
+    assert first["by_sport"]["running"]["distance_km"] == 20.0
+
+
+def test_gear_without_links_reports_note_not_zero(tmp_path: Path) -> None:
+    """空关联必须说「没有记录」，报 0 公里会被读成「买了没穿过」。"""
+    out = call(prepared(tmp_path), "get_gear_mileage", {})
+    second = out["gears"][1]
+    assert "distance_km" not in second
+    assert "无法计算里程" in second["note"]
+    assert "missing_note" in out
+
+
+def test_gear_mileage_mentions_source_of_number(tmp_path: Path) -> None:
+    """里程是加出来的，不是设备给的——这句必须随结果一起返回。"""
+    out = call(prepared(tmp_path), "get_gear_mileage", {})
+    assert "关联活动" in out["mileage_note"]
+
+
+def test_gear_id_hidden_in_strict_but_present_in_normal(tmp_path: Path) -> None:
+    strict = call(prepared(tmp_path / "s"), "get_gear_mileage", {})
+    assert all("id" not in g for g in strict["gears"])
+
+    normal = call(prepared(tmp_path / "n", privacy="normal"), "get_gear_mileage", {})
+    assert normal["gears"][0]["id"] == "700001"
+
+
+def test_overview_reports_gear_coverage(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_data_overview")
+    assert out["gear"]["items"] == 2
+    assert out["gear"]["with_activities"] == 1
+
+
 # ---------- 预期内失败：必须让模型看见原因 ----------
 #
 # 为什么这几条要单独测：SDK 只把 ToolError 的文本透给模型；其他异常被当成
@@ -484,6 +587,7 @@ def test_expected_failures_are_not_wrapped_as_crash(tmp_path: Path) -> None:
         ("get_race_predictions", {"start_date": "2026/07/20"}),
         ("get_vo2max_trend", {"start_date": "2026-07-22", "end_date": "2026-07-20"}),
         ("get_vo2max_trend", {"end_date": "not-a-date"}),
+        ("get_personal_records", {"group": "not-a-group"}),
     ]
     for name, args in cases:
         with pytest.raises(ToolError) as excinfo:

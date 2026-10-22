@@ -52,6 +52,13 @@ METERS = "m"
 COUNT = "count"
 DAYS = "day"
 
+# 展示方式。`unit` 说的是量纲，`metric` 说的是「该按哪种习惯写给人看」——
+# 同为米，水平距离超过 1 公里用 km（21.12 km），爬升则一律用米（1347 m）：
+# 「单次爬升 1.35 km」看起来像距离，而且不符合跑者读爬升的习惯。
+METRIC_DURATION = "duration"
+METRIC_DISTANCE = "distance"
+METRIC_ELEVATION = "elevation"
+
 # 分组标识。与运动类型同名的组可直接对上 activities.sport
 GROUP_RUN = "run"
 GROUP_SWIM = "swim"
@@ -62,35 +69,56 @@ GROUPS = (GROUP_RUN, GROUP_SWIM, GROUP_CYCLE, GROUP_GENERAL)
 
 @dataclass(frozen=True)
 class RecordKind:
-    """一个个人最佳类型的元数据：量纲、中文标签、所属运动组。"""
+    """一个个人最佳类型的元数据：量纲、展示方式、中文标签、所属运动组。"""
 
     unit: str | None
     label: str
     group: str
+    metric: str | None = None
 
 
 # 实测归档里出现的全部类型（20 种）。新增类型时在这里补一行即可；
 # 漏补不会崩，只是没有单位和中文标签，输出仍带原类型名与数值。
 RECORD_KINDS: dict[str, RecordKind] = {
     # 跑步成绩：时间
-    "Best 1km Run": RecordKind(SECONDS, "1 公里跑最快", GROUP_RUN),
-    "Best 1mile Run": RecordKind(SECONDS, "1 英里跑最快", GROUP_RUN),
-    "Best 5km Run": RecordKind(SECONDS, "5 公里跑最快", GROUP_RUN),
-    "Best 10km Run": RecordKind(SECONDS, "10 公里跑最快", GROUP_RUN),
-    "Best Half Marathon": RecordKind(SECONDS, "半程马拉松最快", GROUP_RUN),
-    "Farthest Run": RecordKind(METERS, "单次跑得最远", GROUP_RUN),
+    "Best 1km Run": RecordKind(SECONDS, "1 公里跑最快", GROUP_RUN, METRIC_DURATION),
+    "Best 1mile Run": RecordKind(SECONDS, "1 英里跑最快", GROUP_RUN, METRIC_DURATION),
+    "Best 5km Run": RecordKind(SECONDS, "5 公里跑最快", GROUP_RUN, METRIC_DURATION),
+    "Best 10km Run": RecordKind(SECONDS, "10 公里跑最快", GROUP_RUN, METRIC_DURATION),
+    "Best Half Marathon": RecordKind(
+        SECONDS, "半程马拉松最快", GROUP_RUN, METRIC_DURATION
+    ),
+    "Farthest Run": RecordKind(METERS, "单次跑得最远", GROUP_RUN, METRIC_DISTANCE),
     # 游泳：成绩是时间，距离类是米
-    "Best 100m Pool Swim": RecordKind(SECONDS, "100 米池泳最快", GROUP_SWIM),
-    "Best 400m Pool Swim": RecordKind(SECONDS, "400 米池泳最快", GROUP_SWIM),
-    "Best 750m Pool Swim": RecordKind(SECONDS, "750 米池泳最快", GROUP_SWIM),
-    "Best 1000m Pool Swim": RecordKind(SECONDS, "1000 米池泳最快", GROUP_SWIM),
-    "Best 1500m Pool Swim": RecordKind(SECONDS, "1500 米池泳最快", GROUP_SWIM),
-    "Longest Pool Swim": RecordKind(METERS, "单次游泳最远", GROUP_SWIM),
+    "Best 100m Pool Swim": RecordKind(
+        SECONDS, "100 米池泳最快", GROUP_SWIM, METRIC_DURATION
+    ),
+    "Best 400m Pool Swim": RecordKind(
+        SECONDS, "400 米池泳最快", GROUP_SWIM, METRIC_DURATION
+    ),
+    "Best 750m Pool Swim": RecordKind(
+        SECONDS, "750 米池泳最快", GROUP_SWIM, METRIC_DURATION
+    ),
+    "Best 1000m Pool Swim": RecordKind(
+        SECONDS, "1000 米池泳最快", GROUP_SWIM, METRIC_DURATION
+    ),
+    "Best 1500m Pool Swim": RecordKind(
+        SECONDS, "1500 米池泳最快", GROUP_SWIM, METRIC_DURATION
+    ),
+    "Longest Pool Swim": RecordKind(
+        METERS, "单次游泳最远", GROUP_SWIM, METRIC_DISTANCE
+    ),
     # 骑行
-    "Best 40km Cycle": RecordKind(SECONDS, "40 公里骑行最快", GROUP_CYCLE),
-    "Farthest Cycle": RecordKind(METERS, "单次骑得最远", GROUP_CYCLE),
+    "Best 40km Cycle": RecordKind(
+        SECONDS, "40 公里骑行最快", GROUP_CYCLE, METRIC_DURATION
+    ),
+    "Farthest Cycle": RecordKind(
+        METERS, "单次骑得最远", GROUP_CYCLE, METRIC_DISTANCE
+    ),
     # 与具体运动无关的纪录
-    "Max Elevation Gain": RecordKind(METERS, "单次爬升最多", GROUP_GENERAL),
+    "Max Elevation Gain": RecordKind(
+        METERS, "单次爬升最多", GROUP_GENERAL, METRIC_ELEVATION
+    ),
     "Most Steps in a Day": RecordKind(COUNT, "单日步数最多", GROUP_GENERAL),
     "Most Steps in a Week": RecordKind(COUNT, "单周步数最多", GROUP_GENERAL),
     "Most Steps in a Month": RecordKind(COUNT, "单月步数最多", GROUP_GENERAL),
@@ -99,9 +127,13 @@ RECORD_KINDS: dict[str, RecordKind] = {
 }
 
 # 表里没有的类型按命名推断分组。`Best X` 在佳明里一律是成绩（秒）、
-# `Farthest X` 一律是距离（米），实测 23 条无一例外，所以这两个前缀
-# 连单位一起补；其余只推分组，单位留空表示不敢确定。
-_PREFIX_UNITS = (("Best ", SECONDS), ("Farthest ", METERS), ("Most Steps", COUNT))
+# `Farthest X` 一律是水平距离（米），实测无一例外，所以这两个前缀
+# 连量纲与展示方式一起补；其余只推分组，单位留空表示不敢确定。
+_PREFIX_HINTS = (
+    ("Best ", SECONDS, METRIC_DURATION),
+    ("Farthest ", METERS, METRIC_DISTANCE),
+    ("Most Steps", COUNT, None),
+)
 
 
 def _group_for(name: str) -> str:
@@ -121,13 +153,14 @@ def kind_for(name: str) -> RecordKind:
     if kind is not None:
         return kind
     unit: str | None = None
-    for prefix, candidate in _PREFIX_UNITS:
+    metric: str | None = None
+    for prefix, candidate_unit, candidate_metric in _PREFIX_HINTS:
         if name.startswith(prefix):
-            unit = candidate
+            unit, metric = candidate_unit, candidate_metric
             break
     if unit is None and "streak" in name.lower():
         unit = DAYS
-    return RecordKind(unit, "", _group_for(name))
+    return RecordKind(unit, "", _group_for(name), metric)
 
 
 @dataclass
@@ -159,6 +192,11 @@ class PersonalRecord:
     def label(self) -> str:
         """中文标签；未知类型回落到原始类型名，不编造译名。"""
         return self.kind.label or self.type
+
+    @property
+    def metric(self) -> str | None:
+        """展示方式。只有成绩、水平距离、爬升三类需要特判，其余按 `unit` 走。"""
+        return self.kind.metric
 
 
 @dataclass
@@ -411,6 +449,9 @@ __all__ = [
     "GROUP_SWIM",
     "GROUPS",
     "METERS",
+    "METRIC_DISTANCE",
+    "METRIC_DURATION",
+    "METRIC_ELEVATION",
     "RECORD_KINDS",
     "SECONDS",
     "Gear",
