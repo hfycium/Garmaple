@@ -548,10 +548,13 @@ def test_four_tables_coexist(tmp_path: Path) -> None:
         s.upsert_days([day("2025-04-23")], source="x")
         s.upsert_sleeps([sleep("2025-04-23")], source="x")
         s.upsert_training([train("2025-04-23")], source="x")
+        s.upsert_race_predictions([race("2025-04-23")], source="x")
+        s.upsert_vo2max([vo2("2025-04-23")], source="x")
         assert (
             s.count_activities(), s.count_days(),
             s.count_sleeps(), s.count_training(),
-        ) == (1, 1, 1, 1)
+            s.count_race_predictions(), s.count_vo2max(),
+        ) == (1, 1, 1, 1, 1, 1)
 
 
 def test_broken_training_table_self_heals(tmp_path: Path) -> None:
@@ -573,3 +576,141 @@ def test_broken_training_table_self_heals(tmp_path: Path) -> None:
         assert "weekly_load" in cols
         assert s.count_training() == 0  # 旧表被丢弃，等下次 index 重灌
         assert s.upsert_training([train("2025-04-23")], source="x") == 1
+
+
+# ---------------- race_predictions 表 ----------------
+
+def race(calendar_date: str, **overrides: object):
+    from garmaple.parser.metrics import parse_race_prediction
+
+    from .test_metrics import make_prediction
+
+    rec = parse_race_prediction(
+        make_prediction(calendarDate=calendar_date, **overrides)
+    )
+    assert rec is not None
+    return rec
+
+
+def test_race_upsert_and_count(tmp_path: Path) -> None:
+    with Store(tmp_path / "r.sqlite3") as s:
+        assert s.upsert_race_predictions(
+            [race("2025-12-04"), race("2025-12-05")], source="x"
+        ) == 2
+        assert s.count_race_predictions() == 2
+
+
+def test_race_upsert_is_idempotent_and_updates(tmp_path: Path) -> None:
+    with Store(tmp_path / "r.sqlite3") as s:
+        s.upsert_race_predictions([race("2025-12-04")], source="x")
+        s.upsert_race_predictions(
+            [race("2025-12-04", raceTime5K=1050)], source="x"
+        )
+        assert s.count_race_predictions() == 1
+        assert s.query_race_predictions()[0]["time_5k_s"] == 1050
+
+
+def test_race_roundtrip_keeps_all_times_and_pace(tmp_path: Path) -> None:
+    from garmaple.store import row_to_race
+
+    with Store(tmp_path / "r.sqlite3") as s:
+        s.upsert_race_predictions([race("2025-12-04")], source="x")
+        restored = row_to_race(s.query_race_predictions()[0])
+    assert restored.times == {"5k": 1065, "10k": 2233, "half": 6540, "marathon": 14040}
+    # 配速是派生的，库里没有这一列，读回来要能现算
+    assert restored.pace_s_per_km("5k") == 1065 / 5.0
+
+
+def test_race_missing_distance_stays_null(tmp_path: Path) -> None:
+    """缺的距离必须是 NULL，不能落成 0——0 秒会被当成「预测 0 秒完赛」。"""
+    with Store(tmp_path / "r.sqlite3") as s:
+        s.upsert_race_predictions([race("2025-12-04", raceTimeHalf=None)], source="x")
+        row = s.query_race_predictions()[0]
+    assert row["time_half_s"] is None
+    assert row["time_5k_s"] == 1065
+
+
+def test_race_range_and_query(tmp_path: Path) -> None:
+    with Store(tmp_path / "r.sqlite3") as s:
+        s.upsert_race_predictions(
+            [race("2025-12-04"), race("2025-12-06"), race("2025-12-08")], source="x"
+        )
+        assert s.race_range() == ("2025-12-04", "2025-12-08")
+        rows = s.query_race_predictions(start="2025-12-05", end="2025-12-07")
+    assert [r["date"] for r in rows] == ["2025-12-06"]
+
+
+def test_broken_race_table_self_heals(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "old-race.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE race_predictions (date TEXT PRIMARY KEY, raceTime5K INTEGER);
+        INSERT INTO race_predictions VALUES ('2025-12-04', 1065);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as s:
+        cols = {r[1] for r in s._conn.execute("PRAGMA table_info(race_predictions)")}
+        assert "time_half_s" in cols
+        assert s.count_race_predictions() == 0
+
+
+# ---------------- vo2max 表 ----------------
+
+def vo2(calendar_date: str, **overrides: object):
+    from garmaple.parser.metrics import parse_vo2max
+
+    from .test_metrics import make_vo2max
+
+    rec = parse_vo2max(make_vo2max(calendarDate=calendar_date, **overrides))
+    assert rec is not None
+    return rec
+
+
+def test_vo2max_roundtrip(tmp_path: Path) -> None:
+    from garmaple.store import row_to_vo2max
+
+    with Store(tmp_path / "v.sqlite3") as s:
+        s.upsert_vo2max([vo2("2025-11-25")], source="x")
+        restored = row_to_vo2max(s.query_vo2max()[0])
+    assert restored.vo2max == 62.0
+    assert restored.sport == "RUNNING"
+
+
+def test_vo2max_without_sport_roundtrips_as_null(tmp_path: Path) -> None:
+    with Store(tmp_path / "v.sqlite3") as s:
+        s.upsert_vo2max([vo2("2025-11-25", sport=None)], source="x")
+        row = s.query_vo2max()[0]
+    assert row["sport"] is None
+    assert row["vo2max"] == 62.0
+
+
+def test_vo2max_range(tmp_path: Path) -> None:
+    with Store(tmp_path / "v.sqlite3") as s:
+        s.upsert_vo2max([vo2("2025-11-25"), vo2("2026-10-21")], source="x")
+        assert s.vo2max_range() == ("2025-11-25", "2026-10-21")
+
+
+def test_broken_vo2max_table_self_heals(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "old-vo2.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE vo2max (date TEXT PRIMARY KEY, value REAL);
+        INSERT INTO vo2max VALUES ('2025-11-25', 62.0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as s:
+        cols = {r[1] for r in s._conn.execute("PRAGMA table_info(vo2max)")}
+        assert "vo2max" in cols
+        assert s.count_vo2max() == 0

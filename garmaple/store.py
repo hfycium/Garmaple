@@ -18,11 +18,12 @@ from typing import Iterable
 
 from .parser.activities import Activity
 from .parser.daily import DailyStat
+from .parser.metrics import RacePrediction, Vo2maxSample
 from .parser.sleep import STATUS_OK, SleepRecord
 from .parser.training import TrainingDay
 from .privacy import pseudo_activity_id
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _META_SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -181,6 +182,45 @@ _TRAINING_COLUMNS = (
     "date", "status", "weekly_load", "tunnel_min", "tunnel_max",
     "fitness_trend", "load_trend", "sport", "updated_at",
     "user_profile_id", "source",
+)
+
+# 比赛成绩预测。四个距离各一列，缺哪个就留空——不用 0 占位，
+# 0 秒与「设备没算这个距离」在分析里是两回事。
+# 预测配速不入库：它由时间与标准距离推出来，存一份等于留两份真相。
+_RACE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS race_predictions (
+    date            TEXT PRIMARY KEY,
+    time_5k_s       INTEGER,
+    time_10k_s      INTEGER,
+    time_half_s     INTEGER,
+    time_marathon_s INTEGER,
+    updated_at      TEXT,
+    user_profile_id INTEGER,
+    source          TEXT
+);
+"""
+
+_RACE_COLUMNS = (
+    "date", "time_5k_s", "time_10k_s", "time_half_s", "time_marathon_s",
+    "updated_at", "user_profile_id", "source",
+)
+
+# 最大摄氧量。日期是主键，不是「日期 + 运动项目」：实测同日只会有一个项目，
+# 按日期收敛即可；哪天数据里真的并存两个项目，这里会丢掉一条而不是给出两行，
+# 所以解析层把 sport 当描述字段，不当维度。
+_VO2MAX_SCHEMA = """
+CREATE TABLE IF NOT EXISTS vo2max (
+    date            TEXT PRIMARY KEY,
+    vo2max          REAL NOT NULL,
+    sport           TEXT,
+    updated_at      TEXT,
+    user_profile_id INTEGER,
+    source          TEXT
+);
+"""
+
+_VO2MAX_COLUMNS = (
+    "date", "vo2max", "sport", "updated_at", "user_profile_id", "source",
 )
 
 _COLUMNS = (
@@ -384,6 +424,47 @@ def row_to_training(row: sqlite3.Row) -> TrainingDay:
     )
 
 
+def _race_tuple(rec: RacePrediction, source: str) -> tuple[object, ...]:
+    return (
+        rec.date, rec.time_5k_s, rec.time_10k_s, rec.time_half_s,
+        rec.time_marathon_s, _iso(rec.updated_at), rec.user_profile_id, source,
+    )
+
+
+def row_to_race(row: sqlite3.Row) -> RacePrediction:
+    """把 race_predictions 表的行还原成 RacePrediction。
+
+    配速是 `pace_s_per_km()` 属性算的，不入库、也不在这里补。
+    """
+    return RacePrediction(
+        date=row["date"],
+        time_5k_s=row["time_5k_s"],
+        time_10k_s=row["time_10k_s"],
+        time_half_s=row["time_half_s"],
+        time_marathon_s=row["time_marathon_s"],
+        updated_at=_parse_dt(row["updated_at"]),
+        user_profile_id=row["user_profile_id"],
+    )
+
+
+def _vo2max_tuple(rec: Vo2maxSample, source: str) -> tuple[object, ...]:
+    return (
+        rec.date, rec.vo2max, rec.sport, _iso(rec.updated_at),
+        rec.user_profile_id, source,
+    )
+
+
+def row_to_vo2max(row: sqlite3.Row) -> Vo2maxSample:
+    """把 vo2max 表的行还原成 Vo2maxSample。"""
+    return Vo2maxSample(
+        date=row["date"],
+        vo2max=row["vo2max"],
+        sport=row["sport"],
+        updated_at=_parse_dt(row["updated_at"]),
+        user_profile_id=row["user_profile_id"],
+    )
+
+
 class Store:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -396,6 +477,8 @@ class Store:
         self._conn.executescript(_DAYS_SCHEMA)
         self._conn.executescript(_SLEEPS_SCHEMA)
         self._conn.executescript(_TRAINING_SCHEMA)
+        self._conn.executescript(_RACE_SCHEMA)
+        self._conn.executescript(_VO2MAX_SCHEMA)
         self._conn.commit()
 
     # 结构自愈的判据：每张表缺了这些列就视为旧表
@@ -404,6 +487,8 @@ class Store:
         "days": frozenset({"date", "steps", "resting_hr", "stress_avg", "utc_offset_hours"}),
         "sleeps": frozenset({"date", "in_bed_min", "status", "deep_min"}),
         "training": frozenset({"date", "status", "weekly_load", "tunnel_min"}),
+        "race_predictions": frozenset({"date", "time_5k_s", "time_half_s"}),
+        "vo2max": frozenset({"date", "vo2max"}),
     }
 
     def _migrate(self) -> None:
@@ -496,6 +581,38 @@ class Store:
             self._conn.executemany(sql, rows)
         return len(rows)
 
+    def upsert_race_predictions(
+        self, records: Iterable[RacePrediction], source: str
+    ) -> int:
+        """幂等写入比赛预测，返回写入的行数。"""
+        placeholders = ", ".join("?" * len(_RACE_COLUMNS))
+        sql = (
+            f"INSERT INTO race_predictions ({', '.join(_RACE_COLUMNS)}) VALUES ({placeholders}) "
+            "ON CONFLICT(date) DO UPDATE SET "
+            + ", ".join(f"{c}=excluded.{c}" for c in _RACE_COLUMNS if c != "date")
+        )
+        rows = [_race_tuple(r, source) for r in records]
+        if not rows:
+            return 0
+        with self._conn:
+            self._conn.executemany(sql, rows)
+        return len(rows)
+
+    def upsert_vo2max(self, records: Iterable[Vo2maxSample], source: str) -> int:
+        """幂等写入最大摄氧量，返回写入的行数。"""
+        placeholders = ", ".join("?" * len(_VO2MAX_COLUMNS))
+        sql = (
+            f"INSERT INTO vo2max ({', '.join(_VO2MAX_COLUMNS)}) VALUES ({placeholders}) "
+            "ON CONFLICT(date) DO UPDATE SET "
+            + ", ".join(f"{c}=excluded.{c}" for c in _VO2MAX_COLUMNS if c != "date")
+        )
+        rows = [_vo2max_tuple(r, source) for r in records]
+        if not rows:
+            return 0
+        with self._conn:
+            self._conn.executemany(sql, rows)
+        return len(rows)
+
     def set_meta(self, key: str, value: str) -> None:
         with self._conn:
             self._conn.execute(
@@ -521,6 +638,14 @@ class Store:
 
     def count_training(self) -> int:
         return self._conn.execute("SELECT COUNT(*) AS n FROM training").fetchone()["n"]
+
+    def count_race_predictions(self) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) AS n FROM race_predictions"
+        ).fetchone()["n"]
+
+    def count_vo2max(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) AS n FROM vo2max").fetchone()["n"]
 
     def _query_by_date(
         self,
@@ -588,23 +713,51 @@ class Store:
         """按日期区间取训练状态。一天至多一行（同日多快照已在解析层去掉）。"""
         return self._query_by_date("training", start, end, limit, order)
 
-    def day_range(self) -> tuple[str | None, str | None]:
+    def query_race_predictions(
+        self,
+        start: str | date | None = None,
+        end: str | date | None = None,
+        limit: int | None = None,
+        order: str = "asc",
+    ) -> list[sqlite3.Row]:
+        """按日期区间取比赛预测。一天至多一行。"""
+        return self._query_by_date("race_predictions", start, end, limit, order)
+
+    def query_vo2max(
+        self,
+        start: str | date | None = None,
+        end: str | date | None = None,
+        limit: int | None = None,
+        order: str = "asc",
+    ) -> list[sqlite3.Row]:
+        """按日期区间取最大摄氧量。日期很稀疏，不要按天补值。"""
+        return self._query_by_date("vo2max", start, end, limit, order)
+
+    def _range(self, table: str) -> tuple[str | None, str | None]:
+        """取某张日期表的最小 / 最大日期。
+
+        五张表都是「date 为主键 + 本地日」，覆盖范围问的是同一件事，
+        所以做成一处实现——复制五遍迟早有一处写错表名。
+        """
         row = self._conn.execute(
-            "SELECT MIN(date) AS lo, MAX(date) AS hi FROM days"
+            f"SELECT MIN(date) AS lo, MAX(date) AS hi FROM {table}"
         ).fetchone()
-        return (row["lo"], row["hi"])
+        return (row["lo"], row["hi"]) if row else (None, None)
+
+    def day_range(self) -> tuple[str | None, str | None]:
+        return self._range("days")
 
     def sleep_range(self) -> tuple[str | None, str | None]:
-        row = self._conn.execute(
-            "SELECT MIN(date) AS lo, MAX(date) AS hi FROM sleeps"
-        ).fetchone()
-        return (row["lo"], row["hi"]) if row else (None, None)
+        return self._range("sleeps")
 
     def training_range(self) -> tuple[str | None, str | None]:
-        row = self._conn.execute(
-            "SELECT MIN(date) AS lo, MAX(date) AS hi FROM training"
-        ).fetchone()
-        return (row["lo"], row["hi"]) if row else (None, None)
+        return self._range("training")
+
+    def race_range(self) -> tuple[str | None, str | None]:
+        return self._range("race_predictions")
+
+    def vo2max_range(self) -> tuple[str | None, str | None]:
+        return self._range("vo2max")
 
     def query_activities(
         self,
