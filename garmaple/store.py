@@ -24,7 +24,7 @@ from .parser.sleep import STATUS_OK, SleepRecord
 from .parser.training import TrainingDay
 from .privacy import pseudo_activity_id
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 _META_SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -272,6 +272,25 @@ _GEAR_COLUMNS = (
     "gear_id", "name", "gear_type", "status", "started_on", "max_meters",
     "user_profile_id", "source",
 )
+
+# 逐秒记录（FIT）的定位表。**只存下标，不存文件名**——归档里的 .fit 文件名
+# 形如 `<设备序列号>_<内部编号>.fit`，序列号是身份标识，没有理由落到库里。
+# `archive_idx` 是归档在 Dataset.archives 里的序号（discover 按名字排序，
+# 顺序稳定）；`entry_idx` 是该归档内嵌 zip 里第几个 .fit（zip 条目顺序同样稳定）。
+# 定位方式见 parser/fit.py：file_id.type == "activity" 正好圈出全部活动文件。
+#
+# time_created 不等于活动开始时间（设备在保存文件时才写），实测落在活动区间
+# 附近，因此只用于缩小候选，真正对齐仍要靠 session.start_time。
+_FIT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS fit_files (
+    archive_idx  INTEGER NOT NULL,
+    entry_idx    INTEGER NOT NULL,
+    time_created TEXT,
+    PRIMARY KEY (archive_idx, entry_idx)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fit_files_created ON fit_files(time_created);
+"""
 
 _COLUMNS = (
     "activity_id", "pseudo_id", "sport", "name", "utc_start", "local_start", "date",
@@ -577,6 +596,7 @@ class Store:
         self._conn.executescript(_VO2MAX_SCHEMA)
         self._conn.executescript(_PERSONAL_SCHEMA)
         self._conn.executescript(_GEAR_SCHEMA)
+        self._conn.executescript(_FIT_SCHEMA)
         self._conn.commit()
 
     # 结构自愈的判据：每张表缺了这些列就视为旧表
@@ -590,6 +610,7 @@ class Store:
         "personal_records": frozenset({"record_id", "type", "value", "current"}),
         "gears": frozenset({"gear_id", "name", "max_meters"}),
         "gear_activities": frozenset({"gear_id", "pseudo_id"}),
+        "fit_files": frozenset({"archive_idx", "entry_idx", "time_created"}),
     }
 
     def _migrate(self) -> None:
@@ -785,6 +806,23 @@ class Store:
                     )
         return len(items)
 
+    def upsert_fit_files(self, rows: Iterable[tuple[int, int, str | None]]) -> int:
+        """写入逐秒记录的定位表，元素为 (archive_idx, entry_idx, time_created)。
+
+        整表重建而不是增量：条目下标只在当次扫描里有意义，多个归档包的顺序
+        也可能因为新增包而变化，留着旧行会指到错误的文件上。
+        """
+        items = list(rows)
+        with self._conn:
+            self._conn.execute("DELETE FROM fit_files")
+            if items:
+                self._conn.executemany(
+                    "INSERT OR REPLACE INTO fit_files (archive_idx, entry_idx, time_created) "
+                    "VALUES (?, ?, ?)",
+                    items,
+                )
+        return len(items)
+
     def set_meta(self, key: str, value: str) -> None:
         with self._conn:
             self._conn.execute(
@@ -814,6 +852,32 @@ class Store:
 
     def count_days(self) -> int:
         return self._conn.execute("SELECT COUNT(*) AS n FROM days").fetchone()["n"]
+
+    def count_fit_files(self) -> int:
+        """有逐秒记录的活动文件数。用来判断要不要提示重跑 index。"""
+        return self._conn.execute("SELECT COUNT(*) AS n FROM fit_files").fetchone()["n"]
+
+    def fit_candidates(
+        self, time_from: datetime, time_to: datetime
+    ) -> list[sqlite3.Row]:
+        """取 time_created 落在区间内的活动 FIT 条目。
+
+        `time_created` 是设备保存文件的时刻，不是开始时间：实测它总是落在
+        活动区间附近（最晚比结束晚 37 分钟，最早在活动进行中），所以窗口要
+        留足余量，命中后再用 `session.start_time` 精确确认。
+        """
+        return self._conn.execute(
+            "SELECT archive_idx, entry_idx FROM fit_files "
+            "WHERE time_created IS NOT NULL AND time_created BETWEEN ? AND ? "
+            "ORDER BY time_created",
+            (_iso(time_from), _iso(time_to)),
+        ).fetchall()
+
+    def fit_entries(self) -> list[sqlite3.Row]:
+        """全部活动 FIT 条目，候选窗口没命中时用来兜底全扫。"""
+        return self._conn.execute(
+            "SELECT archive_idx, entry_idx FROM fit_files ORDER BY archive_idx, entry_idx"
+        ).fetchall()
 
     def count_sleeps(self) -> int:
         return self._conn.execute("SELECT COUNT(*) AS n FROM sleeps").fetchone()["n"]

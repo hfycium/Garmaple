@@ -12,6 +12,7 @@ import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from zipfile import BadZipFile
 
 from . import __version__
 from .archive import ArchiveError, discover
@@ -33,6 +34,7 @@ from .parser.training import TrainingDay
 from .parser.training import dedupe as dedupe_training
 from .parser.training import parse_trainings
 from .store import Store
+from .streams import scan_activity_fits
 
 ACTIVITY_GLOB = "*summarizedActivities.json"
 DAILY_GLOB = "UDSFile_*.json"
@@ -186,6 +188,18 @@ def cmd_index(cfg: Config) -> int:
                 f"（去重后 {len(gears)} 双，关联活动 {linked} 次）"
             )
 
+        # 逐秒记录（FIT）：只读每个文件的 file_id 帧，约 2 秒就能拿到全部活动
+        # 文件的定位；完整解析要 5 分钟，因此索引阶段不做，查询时按需解析。
+        fit_rows: list[tuple[int, int, str | None]] = []
+        try:
+            fit_rows = scan_activity_fits(dataset)
+        except (BadZipFile, ArchiveError):
+            fit_rows = []
+        if fit_rows:
+            print(f"逐秒记录   {len(fit_rows)} 个活动 FIT（仅索引文件头）")
+        else:
+            print("逐秒记录   归档中没有内嵌的 .fit，逐秒工具将不可用")
+
         _hr("概览")
         print(f"活动总数   {len(deduped)} 条" + (
             f"（原始 {len(activities)} 条，去重 {len(activities) - len(deduped)} 条）"
@@ -254,6 +268,8 @@ def cmd_index(cfg: Config) -> int:
                 store.upsert_personal_records(personal, source=dataset.archives[0].label)
             if gears:
                 store.upsert_gears(gears, source=dataset.archives[0].label)
+            if fit_rows:
+                store.upsert_fit_files(fit_rows)
             store.set_meta("indexed_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
             store.set_meta("source", dataset.archives[0].label)
             total = store.count_activities()
@@ -264,6 +280,7 @@ def cmd_index(cfg: Config) -> int:
             total_vo2max = store.count_vo2max()
             total_personal = store.count_personal_records()
             total_gears = store.count_gears()
+            total_fits = store.count_fit_files()
 
         _hr("索引")
         print(f"写入位置   {cfg.db_path}")
@@ -275,6 +292,7 @@ def cmd_index(cfg: Config) -> int:
         print(f"库内摄氧量 {total_vo2max} 天")
         print(f"库内纪录   {total_personal} 条")
         print(f"库内装备   {total_gears} 双")
+        print(f"逐秒记录   {total_fits} 次活动可查（其余活动没有对应的 FIT 文件）")
 
     print(f"\n完成。隐私级别 {cfg.privacy}（strict 下坐标与地点不会进入 AI 上下文）")
     return 0
@@ -329,6 +347,11 @@ def cmd_doctor(cfg: Config) -> int:
             print(f"日期范围   {lo} → {hi}")
             nz = store.count_activities_with_zones()
             print(f"心率区间   {nz}/{n} 条活动有区间数据")
+            nf = store.count_fit_files()
+            if nf:
+                print(f"逐秒记录   {nf}/{n} 条活动有 FIT 文件")
+            else:
+                print("逐秒记录   无（归档不含内嵌 .fit，或索引版本过旧需重跑 index）")
             nd = store.count_days()
             dlo, dhi = store.day_range()
             print(f"每日汇总   {nd} 天" + (f"（{dlo} → {dhi}）" if nd else ""))
