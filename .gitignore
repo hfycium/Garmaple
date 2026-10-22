@@ -1,0 +1,41 @@
+# ---------- 个人数据（绝不入库）----------
+# Garmin 官方导出的原始数据包，含健康数据与运动轨迹
+data/
+*.fit
+*.zip
+*.tcx
+*.gpx
+
+# 由原始数据衍生出的产物
+out/
+cache/
+*.db
+*.sqlite
+*.sqlite3
+
+# ---------- 凭据 ----------
+.env
+.env.*
+*.token
+login-trace.json
+credentials.json
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- WorkBuddy ----------
+.workbuddy/
