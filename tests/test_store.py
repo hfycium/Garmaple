@@ -714,3 +714,214 @@ def test_broken_vo2max_table_self_heals(tmp_path: Path) -> None:
         cols = {r[1] for r in s._conn.execute("PRAGMA table_info(vo2max)")}
         assert "vo2max" in cols
         assert s.count_vo2max() == 0
+
+
+# ---------- 个人最佳 ----------
+
+
+def record(**overrides: object):
+    from garmaple.parser.records import parse_record
+
+    from .test_records import make_raw as make_record
+
+    rec = parse_record(make_record(**overrides))
+    assert rec is not None
+    return rec
+
+
+def test_personal_records_upsert_and_count(tmp_path: Path) -> None:
+    with Store(tmp_path / "p.sqlite3") as s:
+        assert s.upsert_personal_records(
+            [record(recordId=1), record(recordId=2, recordType="Farthest Run")],
+            source="x",
+        ) == 2
+        assert s.count_personal_records() == 2
+
+
+def test_personal_records_upsert_is_idempotent_and_updates(tmp_path: Path) -> None:
+    with Store(tmp_path / "p.sqlite3") as s:
+        s.upsert_personal_records([record(recordId=1, value=1194.2)], source="x")
+        s.upsert_personal_records([record(recordId=1, value=1108.3)], source="x")
+        assert s.count_personal_records() == 1
+        assert s.query_personal_records()[0]["value"] == 1108.3
+
+
+def test_personal_records_query_filters_current(tmp_path: Path) -> None:
+    """当前纪录与被刷新的旧纪录要能分开取——合在一起会被当成「有两个 5K 最好成绩」。"""
+    with Store(tmp_path / "p.sqlite3") as s:
+        s.upsert_personal_records(
+            [record(recordId=1, current=True), record(recordId=2, current=False)],
+            source="x",
+        )
+        assert [r["record_id"] for r in s.query_personal_records(current=True)] == [1]
+        assert [r["record_id"] for r in s.query_personal_records(current=False)] == [2]
+        assert len(s.query_personal_records()) == 2
+
+
+def test_personal_record_roundtrip_derives_unit(tmp_path: Path) -> None:
+    """单位、分组、中文标签都不入库，读回来要能从类型名重新推出来。"""
+    from garmaple.store import row_to_personal
+
+    with Store(tmp_path / "p.sqlite3") as s:
+        s.upsert_personal_records(
+            [
+                record(recordId=1, recordType="Best 5km Run", value=1108.3),
+                record(recordId=2, recordType="Farthest Run", value=21116.4),
+                record(recordId=3, recordType="Most Steps in a Day", activityId=0),
+            ],
+            source="x",
+        )
+        rows = s.query_personal_records()
+    restored = {r["record_id"]: row_to_personal(r) for r in rows}
+    assert restored[1].unit == "s"
+    assert restored[2].unit == "m"
+    assert restored[3].unit == "count"
+    assert restored[1].label == "5 公里跑最快"
+    assert restored[3].date is None
+
+
+def test_broken_personal_table_self_heals(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "old-pr.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE personal_records (id INTEGER PRIMARY KEY, name TEXT);
+        INSERT INTO personal_records VALUES (1, 'old');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as s:
+        cols = {r[1] for r in s._conn.execute("PRAGMA table_info(personal_records)")}
+        assert "record_id" in cols
+        assert s.count_personal_records() == 0
+
+
+# ---------- 装备 ----------
+
+
+def gear(gear_id: int = 700001, activity_ids: list[int] | None = None, **overrides: object):
+    from garmaple.parser.records import parse_gear
+
+    from .test_records import make_gear as make_gear_raw
+
+    raw = make_gear_raw(gearPk=gear_id, **overrides)
+    links = {
+        str(gear_id): [{"gearPk": gear_id, "activityId": a} for a in (activity_ids or [])]
+    }
+    parsed = parse_gear(raw, links)
+    assert parsed is not None
+    return parsed
+
+
+def test_gear_upsert_and_count(tmp_path: Path) -> None:
+    with Store(tmp_path / "g.sqlite3") as s:
+        assert s.upsert_gears([gear(1), gear(2, name="第二双")], source="x") == 2
+        assert s.count_gears() == 2
+
+
+def test_gear_upsert_is_idempotent(tmp_path: Path) -> None:
+    with Store(tmp_path / "g.sqlite3") as s:
+        s.upsert_gears([gear(1)], source="x")
+        s.upsert_gears([gear(1, name="改过的名字")], source="x")
+        assert s.count_gears() == 1
+        assert s.query_gears()[0]["name"] == "改过的名字"
+
+
+def test_gear_usage_sums_matched_activity_distance(tmp_path: Path) -> None:
+    """里程由关联活动的距离求和，不是设备给的累计值（归档里没有那个字段）。"""
+    with Store(tmp_path / "g.sqlite3") as s:
+        s.upsert_activities([act(11), act(12)], source="x")
+        s.upsert_gears([gear(1, activity_ids=[11, 12])], source="x")
+        usage = s.gear_usage()[1]
+    # make_raw 默认 distance=1_000_000cm -> 10000m，两条就是 20km
+    assert usage.activity_count == 2
+    assert usage.distance_m == 20000.0
+    assert usage.assigned_count == 2
+    assert usage.unmatched_count == 0
+    assert usage.by_sport["running"].count == 2
+
+
+def test_gear_usage_without_links_is_empty_not_zero(tmp_path: Path) -> None:
+    """没有关联的装备必须给出「没有记录」，不能给出「0 公里」。"""
+    with Store(tmp_path / "g.sqlite3") as s:
+        s.upsert_activities([act(11)], source="x")
+        s.upsert_gears([gear(1, activity_ids=[])], source="x")
+        usage = s.gear_usage()[1]
+    assert usage.activity_count == 0
+    assert usage.distance_m is None
+    assert usage.has_activities is False
+    assert usage.by_sport == {}
+
+
+def test_gear_usage_separates_unmatched_links(tmp_path: Path) -> None:
+    """关联里提到、但活动摘要里没有的那次，要让上层知道里程是偏小的。"""
+    with Store(tmp_path / "g.sqlite3") as s:
+        s.upsert_activities([act(11)], source="x")
+        s.upsert_gears([gear(1, activity_ids=[11, 999])], source="x")
+        usage = s.gear_usage()[1]
+    assert usage.assigned_count == 2
+    assert usage.activity_count == 1
+    assert usage.unmatched_count == 1
+
+
+def test_gear_relink_replaces_previous_activities(tmp_path: Path) -> None:
+    """重新绑定装备后，旧关联必须消失——只增不减会让里程永远偏高。"""
+    with Store(tmp_path / "g.sqlite3") as s:
+        s.upsert_activities([act(11), act(12)], source="x")
+        s.upsert_gears([gear(1, activity_ids=[11, 12])], source="x")
+        s.upsert_gears([gear(1, activity_ids=[12])], source="x")
+        usage = s.gear_usage()[1]
+    assert usage.activity_count == 1
+    assert usage.distance_m == 10000.0
+
+
+def test_gear_usage_by_sport_breakdown(tmp_path: Path) -> None:
+    from .test_activities import make_raw as make_activity
+
+    with Store(tmp_path / "g.sqlite3") as s:
+        s.upsert_activities(
+            [act(11), act(12, activityType="walking")], source="x"
+        )
+        s.upsert_gears([gear(1, activity_ids=[11, 12])], source="x")
+        usage = s.gear_usage()[1]
+    assert set(usage.by_sport) == {"running", "walking"}
+    assert usage.by_sport["running"].count == 1
+    assert usage.distance_m == 20000.0
+
+
+def test_broken_gear_table_self_heals(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "old-gear.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE gears (gear_id INTEGER PRIMARY KEY, label TEXT);
+        INSERT INTO gears VALUES (1, 'old');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as s:
+        cols = {r[1] for r in s._conn.execute("PRAGMA table_info(gears)")}
+        assert "max_meters" in cols
+        assert s.count_gears() == 0
+
+
+def test_all_tables_coexist(tmp_path: Path) -> None:
+    with Store(tmp_path / "all.sqlite3") as s:
+        s.upsert_activities([act(11)], source="x")
+        s.upsert_days([day("2025-04-23")], source="x")
+        s.upsert_sleeps([sleep("2025-04-23")], source="x")
+        s.upsert_training([train("2025-04-23")], source="x")
+        s.upsert_personal_records([record(recordId=1)], source="x")
+        s.upsert_gears([gear(1, activity_ids=[11])], source="x")
+        assert (
+            s.count_activities(), s.count_days(), s.count_sleeps(),
+            s.count_training(), s.count_personal_records(), s.count_gears(),
+        ) == (1, 1, 1, 1, 1, 1)

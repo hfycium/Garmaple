@@ -19,11 +19,12 @@ from typing import Iterable
 from .parser.activities import Activity
 from .parser.daily import DailyStat
 from .parser.metrics import RacePrediction, Vo2maxSample
+from .parser.records import Gear, GearUsage, PersonalRecord, SportUsage
 from .parser.sleep import STATUS_OK, SleepRecord
 from .parser.training import TrainingDay
 from .privacy import pseudo_activity_id
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _META_SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -221,6 +222,55 @@ CREATE TABLE IF NOT EXISTS vo2max (
 
 _VO2MAX_COLUMNS = (
     "date", "vo2max", "sport", "updated_at", "user_profile_id", "source",
+)
+
+# 个人最佳。主键是设备给的 personalRecordId，不是日期——同一天可能刷新多条，
+# 同一类型也会有「当前纪录」与「被刷新的旧纪录」并存，按日期做键会互相覆盖。
+# 单位、中文标签、分组都不入库：它们由 type 查表推出来，存一份等于留两份真相。
+_PERSONAL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS personal_records (
+    record_id       INTEGER PRIMARY KEY,
+    type            TEXT NOT NULL,
+    value           REAL NOT NULL,
+    date            TEXT,
+    current         INTEGER NOT NULL DEFAULT 1,
+    user_profile_id INTEGER,
+    source          TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_personal_type ON personal_records(type);
+"""
+
+_PERSONAL_COLUMNS = (
+    "record_id", "type", "value", "date", "current", "user_profile_id", "source",
+)
+
+# 装备。装备本身没有累计里程字段，里程靠 gear_activities 关联活动求和，
+# 所以这里不存 distance——活动表变了，里程自然跟着变，不会有两份互相矛盾的数。
+_GEAR_SCHEMA = """
+CREATE TABLE IF NOT EXISTS gears (
+    gear_id         INTEGER PRIMARY KEY,
+    name            TEXT,
+    gear_type       TEXT,
+    status          TEXT,
+    started_on      TEXT,
+    max_meters      REAL,
+    user_profile_id INTEGER,
+    source          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS gear_activities (
+    gear_id   INTEGER NOT NULL,
+    pseudo_id TEXT NOT NULL,
+    PRIMARY KEY (gear_id, pseudo_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gear_activities_pseudo ON gear_activities(pseudo_id);
+"""
+
+_GEAR_COLUMNS = (
+    "gear_id", "name", "gear_type", "status", "started_on", "max_meters",
+    "user_profile_id", "source",
 )
 
 _COLUMNS = (
@@ -465,6 +515,52 @@ def row_to_vo2max(row: sqlite3.Row) -> Vo2maxSample:
     )
 
 
+def _personal_tuple(rec: PersonalRecord, source: str) -> tuple[object, ...]:
+    return (
+        rec.record_id, rec.type, rec.value, rec.date,
+        1 if rec.current else 0, rec.user_profile_id, source,
+    )
+
+
+def row_to_personal(row: sqlite3.Row) -> PersonalRecord:
+    """把 personal_records 表的行还原成 PersonalRecord。
+
+    `unit` / `label` / `group` 是由 type 查表得到的属性，不在这里补。
+    """
+    return PersonalRecord(
+        record_id=row["record_id"],
+        type=row["type"],
+        value=row["value"],
+        date=row["date"],
+        current=bool(row["current"]),
+        user_profile_id=row["user_profile_id"],
+    )
+
+
+def _gear_tuple(gear: Gear, source: str) -> tuple[object, ...]:
+    return (
+        gear.gear_id, gear.name, gear.gear_type, gear.status, gear.started_on,
+        gear.max_meters, gear.user_profile_id, source,
+    )
+
+
+def row_to_gear(row: sqlite3.Row) -> Gear:
+    """把 gears 表的行还原成 Gear。
+
+    关联的 activityId 不回填：查询里程走 `gear_usage()` 的聚合，
+    把几百个 ID 读进内存再重算一遍没有意义。
+    """
+    return Gear(
+        gear_id=row["gear_id"],
+        name=row["name"],
+        gear_type=row["gear_type"],
+        status=row["status"],
+        started_on=row["started_on"],
+        max_meters=row["max_meters"],
+        user_profile_id=row["user_profile_id"],
+    )
+
+
 class Store:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -479,6 +575,8 @@ class Store:
         self._conn.executescript(_TRAINING_SCHEMA)
         self._conn.executescript(_RACE_SCHEMA)
         self._conn.executescript(_VO2MAX_SCHEMA)
+        self._conn.executescript(_PERSONAL_SCHEMA)
+        self._conn.executescript(_GEAR_SCHEMA)
         self._conn.commit()
 
     # 结构自愈的判据：每张表缺了这些列就视为旧表
@@ -489,6 +587,9 @@ class Store:
         "training": frozenset({"date", "status", "weekly_load", "tunnel_min"}),
         "race_predictions": frozenset({"date", "time_5k_s", "time_half_s"}),
         "vo2max": frozenset({"date", "vo2max"}),
+        "personal_records": frozenset({"record_id", "type", "value", "current"}),
+        "gears": frozenset({"gear_id", "name", "max_meters"}),
+        "gear_activities": frozenset({"gear_id", "pseudo_id"}),
     }
 
     def _migrate(self) -> None:
@@ -613,6 +714,65 @@ class Store:
             self._conn.executemany(sql, rows)
         return len(rows)
 
+    def upsert_personal_records(
+        self, records: Iterable[PersonalRecord], source: str
+    ) -> int:
+        """幂等写入个人最佳，返回写入的行数。"""
+        placeholders = ", ".join("?" * len(_PERSONAL_COLUMNS))
+        sql = (
+            f"INSERT INTO personal_records ({', '.join(_PERSONAL_COLUMNS)}) "
+            f"VALUES ({placeholders}) "
+            "ON CONFLICT(record_id) DO UPDATE SET "
+            + ", ".join(
+                f"{c}=excluded.{c}" for c in _PERSONAL_COLUMNS if c != "record_id"
+            )
+        )
+        rows = [_personal_tuple(r, source) for r in records]
+        if not rows:
+            return 0
+        with self._conn:
+            self._conn.executemany(sql, rows)
+        return len(rows)
+
+    def upsert_gears(self, gears: Iterable[Gear], source: str) -> int:
+        """幂等写入装备与它的活动关联，返回写入的装备数。
+
+        关联表用伪 ID 而不是原始 activityId：与 activities 表同一套键，
+        求里程时可以直接 join，库里也不必再留一份真实 ID。
+
+        每双鞋的关联先清空再写回。装备的关联会变（换鞋、解绑、重新绑定），
+        只增不减会让里程永远偏高，而这种偏差没有任何地方会报错。
+        """
+        items = list(gears)
+        if not items:
+            return 0
+
+        placeholders = ", ".join("?" * len(_GEAR_COLUMNS))
+        sql = (
+            f"INSERT INTO gears ({', '.join(_GEAR_COLUMNS)}) VALUES ({placeholders}) "
+            "ON CONFLICT(gear_id) DO UPDATE SET "
+            + ", ".join(f"{c}=excluded.{c}" for c in _GEAR_COLUMNS if c != "gear_id")
+        )
+        rows = [_gear_tuple(g, source) for g in items]
+
+        with self._conn:
+            self._conn.executemany(sql, rows)
+            for gear in items:
+                self._conn.execute(
+                    "DELETE FROM gear_activities WHERE gear_id=?", (gear.gear_id,)
+                )
+                links = [
+                    (gear.gear_id, pseudo_activity_id(aid))
+                    for aid in gear.activity_ids
+                ]
+                if links:
+                    self._conn.executemany(
+                        "INSERT OR IGNORE INTO gear_activities (gear_id, pseudo_id) "
+                        "VALUES (?, ?)",
+                        links,
+                    )
+        return len(items)
+
     def set_meta(self, key: str, value: str) -> None:
         with self._conn:
             self._conn.execute(
@@ -646,6 +806,14 @@ class Store:
 
     def count_vo2max(self) -> int:
         return self._conn.execute("SELECT COUNT(*) AS n FROM vo2max").fetchone()["n"]
+
+    def count_personal_records(self) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) AS n FROM personal_records"
+        ).fetchone()["n"]
+
+    def count_gears(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) AS n FROM gears").fetchone()["n"]
 
     def _query_by_date(
         self,
@@ -732,6 +900,82 @@ class Store:
     ) -> list[sqlite3.Row]:
         """按日期区间取最大摄氧量。日期很稀疏，不要按天补值。"""
         return self._query_by_date("vo2max", start, end, limit, order)
+
+    def query_personal_records(self, current: bool | None = None) -> list[sqlite3.Row]:
+        """取个人最佳。`current` 为 None 时全给，True/False 只取相应的一类。
+
+        不按日期排序——这些纪录没有统一的日期口径，排序交给调用方按类别做。
+        """
+        sql = "SELECT * FROM personal_records"
+        params: list[object] = []
+        if current is not None:
+            sql += " WHERE current = ?"
+            params.append(1 if current else 0)
+        sql += " ORDER BY type, value"
+        return self._conn.execute(sql, params).fetchall()
+
+    def query_gears(self) -> list[sqlite3.Row]:
+        return self._conn.execute("SELECT * FROM gears ORDER BY gear_id").fetchall()
+
+    def gear_usage(self) -> dict[int, GearUsage]:
+        """每双装备的累计使用情况。
+
+        LEFT JOIN 让没有关联活动的装备仍然出现。这时 `activity_count` 是 0、
+        `distance_m` 是 None——「归档里没有关联记录」与「累计跑了 0 公里」
+        必须分得开，实测确实有一双鞋整个关联键都不存在。
+
+        `assigned_count` 是关联表里声明的条数。它与 `activity_count` 不等时
+        说明有关联的活动不在活动摘要里（导出包不完整或活动已删），
+        此时里程是偏小的，输出层要能说出来。
+        """
+        usage: dict[int, GearUsage] = {
+            row["gear_id"]: GearUsage() for row in self.query_gears()
+        }
+
+        for row in self._conn.execute(
+            "SELECT gear_id, COUNT(*) AS n FROM gear_activities GROUP BY gear_id"
+        ):
+            gear = usage.get(row["gear_id"])
+            if gear is not None:
+                gear.assigned_count = row["n"]
+
+        for row in self._conn.execute(
+            """
+            SELECT ga.gear_id,
+                   COUNT(a.activity_id) AS n,
+                   SUM(a.distance_m)    AS d,
+                   MIN(a.date)          AS lo,
+                   MAX(a.date)          AS hi
+            FROM gear_activities ga
+            JOIN activities a ON a.pseudo_id = ga.pseudo_id
+            GROUP BY ga.gear_id
+            """
+        ):
+            gear = usage.get(row["gear_id"])
+            if gear is None:
+                continue
+            gear.activity_count = row["n"]
+            gear.distance_m = row["d"]
+            gear.first_date = row["lo"]
+            gear.last_date = row["hi"]
+
+        for row in self._conn.execute(
+            """
+            SELECT ga.gear_id, a.sport, COUNT(*) AS n, SUM(a.distance_m) AS d
+            FROM gear_activities ga
+            JOIN activities a ON a.pseudo_id = ga.pseudo_id
+            GROUP BY ga.gear_id, a.sport
+            ORDER BY n DESC
+            """
+        ):
+            gear = usage.get(row["gear_id"])
+            if gear is None:
+                continue
+            gear.by_sport[row["sport"]] = SportUsage(
+                count=row["n"], distance_m=row["d"] or 0.0
+            )
+
+        return usage
 
     def _range(self, table: str) -> tuple[str | None, str | None]:
         """取某张日期表的最小 / 最大日期。
