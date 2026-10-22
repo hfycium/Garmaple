@@ -23,11 +23,15 @@ from .parser.daily import parse_days
 from .parser.sleep import STATUS_OK, SleepRecord
 from .parser.sleep import dedupe as dedupe_sleeps
 from .parser.sleep import parse_sleeps
+from .parser.training import TrainingDay
+from .parser.training import dedupe as dedupe_training
+from .parser.training import parse_trainings
 from .store import Store
 
 ACTIVITY_GLOB = "*summarizedActivities.json"
 DAILY_GLOB = "UDSFile_*.json"
 SLEEP_GLOB = "*sleepData.json"
+TRAINING_GLOB = "TrainingHistory_*.json"
 
 
 def _force_utf8() -> None:
@@ -105,6 +109,19 @@ def cmd_index(cfg: Config) -> int:
             sleeps = dedupe_sleeps(sleeps)
             print(f"睡眠分片   {len(sleep_shards)} 个 → {raw_sleeps} 晚（去重后 {len(sleeps)} 晚）")
 
+        # 训练状态：同一天可能有多条同步快照，解析层按时间戳收敛成一条
+        training: list[TrainingDay] = []
+        training_shards = dataset.find_all(TRAINING_GLOB)
+        for archive, name in training_shards:
+            training.extend(parse_trainings(archive.read_json(name)))
+        raw_training = len(training)
+        training = dedupe_training(training)
+        if training_shards:
+            print(
+                f"训练分片   {len(training_shards)} 个 → {raw_training} 条"
+                f"（同日合并后 {len(training)} 天）"
+            )
+
         _hr("概览")
         print(f"活动总数   {len(deduped)} 条" + (
             f"（原始 {len(activities)} 条，去重 {len(activities) - len(deduped)} 条）"
@@ -126,6 +143,12 @@ def cmd_index(cfg: Config) -> int:
             print("睡眠记录   解析结果为空，跳过")
         else:
             print("睡眠记录   归档中没有 *sleepData.json，跳过")
+        if training:
+            print(f"训练状态   {len(training)} 天（{training[0].date} → {training[-1].date}）")
+        elif training_shards:
+            print("训练状态   解析结果为空，跳过")
+        else:
+            print("训练状态   归档中没有 TrainingHistory_*.json，跳过")
 
         with Store(cfg.db_path) as store:
             store.upsert_activities(deduped, source=dataset.archives[0].label)
@@ -133,17 +156,21 @@ def cmd_index(cfg: Config) -> int:
                 store.upsert_days(days, source=dataset.archives[0].label)
             if sleeps:
                 store.upsert_sleeps(sleeps, source=dataset.archives[0].label)
+            if training:
+                store.upsert_training(training, source=dataset.archives[0].label)
             store.set_meta("indexed_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
             store.set_meta("source", dataset.archives[0].label)
             total = store.count_activities()
             total_days = store.count_days()
             total_sleeps = store.count_sleeps()
+            total_training = store.count_training()
 
         _hr("索引")
         print(f"写入位置   {cfg.db_path}")
         print(f"库内活动   {total} 条")
         print(f"库内日汇总 {total_days} 天")
         print(f"库内睡眠   {total_sleeps} 晚")
+        print(f"库内训练   {total_training} 天")
 
     print(f"\n完成。隐私级别 {cfg.privacy}（strict 下坐标与地点不会进入 AI 上下文）")
     return 0
@@ -169,6 +196,8 @@ def cmd_doctor(cfg: Config) -> int:
             print(f"日汇总分片 {len(daily_shards)} 个")
             sleep_shards = dataset.find_all(SLEEP_GLOB)
             print(f"睡眠分片   {len(sleep_shards)} 个")
+            training_shards = dataset.find_all(TRAINING_GLOB)
+            print(f"训练分片   {len(training_shards)} 个")
             fits = dataset.find_one("UploadedFiles_*.zip")
             if fits:
                 with fits[0].nested(fits[1]) as nested:
@@ -192,6 +221,9 @@ def cmd_doctor(cfg: Config) -> int:
             ns = store.count_sleeps()
             slo, shi = store.sleep_range()
             print(f"睡眠       {ns} 晚" + (f"（{slo} → {shi}）" if ns else ""))
+            nt = store.count_training()
+            tlo, thi = store.training_range()
+            print(f"训练状态   {nt} 天" + (f"（{tlo} → {thi}）" if nt else ""))
             print(f"上次索引   {store.get_meta('indexed_at') or '未知'}")
             ok &= n > 0
     else:
