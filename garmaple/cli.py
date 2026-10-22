@@ -17,9 +17,13 @@ from . import __version__
 from .archive import ArchiveError, discover
 from .config import Config, ConfigError
 from .parser.activities import parse_activities
+from .parser.daily import DailyStat
+from .parser.daily import dedupe as dedupe_days
+from .parser.daily import parse_days
 from .store import Store
 
 ACTIVITY_GLOB = "*summarizedActivities.json"
+DAILY_GLOB = "UDSFile_*.json"
 
 
 def _force_utf8() -> None:
@@ -55,9 +59,10 @@ def cmd_index(cfg: Config) -> int:
 
         activities = []
         for archive, name in shards:
-            parsed = parse_activities(archive.read_json(name))
-            activities.extend(parsed)
-            print(f"  {name.rsplit('/', 1)[-1]:<44} {len(parsed):>5} 条")
+            activities.extend(parse_activities(archive.read_json(name)))
+        # 分片文件名常带设备序列号（形如 <序列号>_1_summarizedActivities.json），
+        # 不逐条打印文件名，只报数量，免得用户把终端输出贴进 issue 时泄出去
+        print(f"活动分片   {len(shards)} 个 → {len(activities)} 条")
 
         if not activities:
             print("错误：解析结果为空", file=sys.stderr)
@@ -70,6 +75,16 @@ def cmd_index(cfg: Config) -> int:
         dates = sorted(a.utc_start for a in deduped if a.utc_start)
         sports = Counter(a.sport for a in deduped)
 
+        # 每日汇总（UDS）：没有这份数据也能用活动工具，因此缺失只提示不报错
+        days: list[DailyStat] = []
+        daily_shards = dataset.find_all(DAILY_GLOB)
+        for archive, name in daily_shards:
+            days.extend(parse_days(archive.read_json(name)))
+        raw_days = len(days)
+        days = dedupe_days(days)
+        if daily_shards:
+            print(f"日汇总分片 {len(daily_shards)} 个 → {raw_days} 天（去重后 {len(days)} 天）")
+
         _hr("概览")
         print(f"活动总数   {len(deduped)} 条" + (
             f"（原始 {len(activities)} 条，去重 {len(activities) - len(deduped)} 条）"
@@ -78,16 +93,26 @@ def cmd_index(cfg: Config) -> int:
         if dates:
             print(f"时间跨度   {dates[0].date()} → {dates[-1].date()}")
         print("运动类型   " + ", ".join(f"{k} {v}" for k, v in sports.most_common(8)))
+        if days:
+            print(f"每日汇总   {len(days)} 天（{days[0].date} → {days[-1].date}）")
+        elif daily_shards:
+            print("每日汇总   解析结果为空，跳过")
+        else:
+            print("每日汇总   归档中没有 UDSFile_*.json，跳过")
 
         with Store(cfg.db_path) as store:
             store.upsert_activities(deduped, source=dataset.archives[0].label)
+            if days:
+                store.upsert_days(days, source=dataset.archives[0].label)
             store.set_meta("indexed_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
             store.set_meta("source", dataset.archives[0].label)
             total = store.count_activities()
+            total_days = store.count_days()
 
         _hr("索引")
         print(f"写入位置   {cfg.db_path}")
         print(f"库内活动   {total} 条")
+        print(f"库内日汇总 {total_days} 天")
 
     print(f"\n完成。隐私级别 {cfg.privacy}（strict 下坐标与地点不会进入 AI 上下文）")
     return 0
@@ -109,6 +134,8 @@ def cmd_doctor(cfg: Config) -> int:
             print(f"导出包     {len(dataset)} 个")
             shards = dataset.find_all(ACTIVITY_GLOB)
             print(f"活动分片   {len(shards)} 个")
+            daily_shards = dataset.find_all(DAILY_GLOB)
+            print(f"日汇总分片 {len(daily_shards)} 个")
             fits = dataset.find_one("UploadedFiles_*.zip")
             if fits:
                 with fits[0].nested(fits[1]) as nested:
@@ -126,6 +153,9 @@ def cmd_doctor(cfg: Config) -> int:
             lo, hi = store.date_range()
             print(f"活动       {n} 条")
             print(f"日期范围   {lo} → {hi}")
+            nd = store.count_days()
+            dlo, dhi = store.day_range()
+            print(f"每日汇总   {nd} 天" + (f"（{dlo} → {dhi}）" if nd else ""))
             print(f"上次索引   {store.get_meta('indexed_at') or '未知'}")
             ok &= n > 0
     else:
