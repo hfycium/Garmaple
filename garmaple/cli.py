@@ -20,6 +20,9 @@ from .parser.activities import parse_activities
 from .parser.daily import DailyStat
 from .parser.daily import dedupe as dedupe_days
 from .parser.daily import parse_days
+from .parser.metrics import RacePrediction, Vo2maxSample
+from .parser.metrics import dedupe_predictions, dedupe_vo2max
+from .parser.metrics import parse_race_predictions, parse_vo2max_samples
 from .parser.sleep import STATUS_OK, SleepRecord
 from .parser.sleep import dedupe as dedupe_sleeps
 from .parser.sleep import parse_sleeps
@@ -32,6 +35,8 @@ ACTIVITY_GLOB = "*summarizedActivities.json"
 DAILY_GLOB = "UDSFile_*.json"
 SLEEP_GLOB = "*sleepData.json"
 TRAINING_GLOB = "TrainingHistory_*.json"
+RACE_GLOB = "RunRacePredictions_*.json"
+VO2MAX_GLOB = "MetricsMaxMetData_*.json"
 
 
 def _force_utf8() -> None:
@@ -122,6 +127,32 @@ def cmd_index(cfg: Config) -> int:
                 f"（同日合并后 {len(training)} 天）"
             )
 
+        # 比赛预测：同一天设备会重算多次，解析层按时间戳收敛成一条
+        races: list[RacePrediction] = []
+        race_shards = dataset.find_all(RACE_GLOB)
+        for archive, name in race_shards:
+            races.extend(parse_race_predictions(archive.read_json(name)))
+        raw_races = len(races)
+        races = dedupe_predictions(races)
+        if race_shards:
+            print(
+                f"比赛预测   {len(race_shards)} 个 → {raw_races} 条"
+                f"（同日合并后 {len(races)} 天）"
+            )
+
+        # 最大摄氧量：只有跑出有效数据的日子才有，日期天然稀疏
+        vo2maxes: list[Vo2maxSample] = []
+        vo2max_shards = dataset.find_all(VO2MAX_GLOB)
+        for archive, name in vo2max_shards:
+            vo2maxes.extend(parse_vo2max_samples(archive.read_json(name)))
+        raw_vo2max = len(vo2maxes)
+        vo2maxes = dedupe_vo2max(vo2maxes)
+        if vo2max_shards:
+            print(
+                f"最大摄氧量 {len(vo2max_shards)} 个 → {raw_vo2max} 条"
+                f"（同日合并后 {len(vo2maxes)} 天）"
+            )
+
         _hr("概览")
         print(f"活动总数   {len(deduped)} 条" + (
             f"（原始 {len(activities)} 条，去重 {len(activities) - len(deduped)} 条）"
@@ -149,6 +180,18 @@ def cmd_index(cfg: Config) -> int:
             print("训练状态   解析结果为空，跳过")
         else:
             print("训练状态   归档中没有 TrainingHistory_*.json，跳过")
+        if races:
+            print(f"比赛预测   {len(races)} 天（{races[0].date} → {races[-1].date}）")
+        elif race_shards:
+            print("比赛预测   解析结果为空，跳过")
+        else:
+            print("比赛预测   归档中没有 RunRacePredictions_*.json，跳过")
+        if vo2maxes:
+            print(f"最大摄氧量 {len(vo2maxes)} 天（{vo2maxes[0].date} → {vo2maxes[-1].date}）")
+        elif vo2max_shards:
+            print("最大摄氧量 解析结果为空，跳过")
+        else:
+            print("最大摄氧量 归档中没有 MetricsMaxMetData_*.json，跳过")
 
         with Store(cfg.db_path) as store:
             store.upsert_activities(deduped, source=dataset.archives[0].label)
@@ -158,12 +201,18 @@ def cmd_index(cfg: Config) -> int:
                 store.upsert_sleeps(sleeps, source=dataset.archives[0].label)
             if training:
                 store.upsert_training(training, source=dataset.archives[0].label)
+            if races:
+                store.upsert_race_predictions(races, source=dataset.archives[0].label)
+            if vo2maxes:
+                store.upsert_vo2max(vo2maxes, source=dataset.archives[0].label)
             store.set_meta("indexed_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
             store.set_meta("source", dataset.archives[0].label)
             total = store.count_activities()
             total_days = store.count_days()
             total_sleeps = store.count_sleeps()
             total_training = store.count_training()
+            total_races = store.count_race_predictions()
+            total_vo2max = store.count_vo2max()
 
         _hr("索引")
         print(f"写入位置   {cfg.db_path}")
@@ -171,6 +220,8 @@ def cmd_index(cfg: Config) -> int:
         print(f"库内日汇总 {total_days} 天")
         print(f"库内睡眠   {total_sleeps} 晚")
         print(f"库内训练   {total_training} 天")
+        print(f"库内预测   {total_races} 天")
+        print(f"库内摄氧量 {total_vo2max} 天")
 
     print(f"\n完成。隐私级别 {cfg.privacy}（strict 下坐标与地点不会进入 AI 上下文）")
     return 0
@@ -198,6 +249,10 @@ def cmd_doctor(cfg: Config) -> int:
             print(f"睡眠分片   {len(sleep_shards)} 个")
             training_shards = dataset.find_all(TRAINING_GLOB)
             print(f"训练分片   {len(training_shards)} 个")
+            race_shards = dataset.find_all(RACE_GLOB)
+            print(f"预测分片   {len(race_shards)} 个")
+            vo2max_shards = dataset.find_all(VO2MAX_GLOB)
+            print(f"摄氧量分片 {len(vo2max_shards)} 个")
             fits = dataset.find_one("UploadedFiles_*.zip")
             if fits:
                 with fits[0].nested(fits[1]) as nested:
@@ -224,6 +279,12 @@ def cmd_doctor(cfg: Config) -> int:
             nt = store.count_training()
             tlo, thi = store.training_range()
             print(f"训练状态   {nt} 天" + (f"（{tlo} → {thi}）" if nt else ""))
+            nr = store.count_race_predictions()
+            rlo, rhi = store.race_range()
+            print(f"比赛预测   {nr} 天" + (f"（{rlo} → {rhi}）" if nr else ""))
+            nv = store.count_vo2max()
+            vlo, vhi = store.vo2max_range()
+            print(f"最大摄氧量 {nv} 天" + (f"（{vlo} → {vhi}）" if nv else ""))
             print(f"上次索引   {store.get_meta('indexed_at') or '未知'}")
             ok &= n > 0
     else:

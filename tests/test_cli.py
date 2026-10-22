@@ -17,6 +17,7 @@ from garmaple.store import Store
 
 from .test_activities import make_raw
 from .test_daily import make_block
+from .test_metrics import make_prediction, make_vo2max
 from .test_sleep import make_sleep
 from .test_training import make_block as make_training
 
@@ -37,11 +38,13 @@ def build_archive(
     days: int = 2,
     sleeps: int | None = None,
     training: int | None = None,
+    races: int | None = None,
+    vo2max: int | None = None,
 ) -> Path:
-    """造一个最小导出包：活动摘要 + 每日汇总 + 睡眠 + 训练状态。
+    """造一个最小导出包：活动 + 日汇总 + 睡眠 + 训练状态 + 预测 + 摄氧量。
 
-    `sleeps` / `training` 为 None 时与 `days` 同天数；显式传 0 则不写对应分片，
-    用于验证「缺这份数据也能正常索引」。
+    `sleeps` / `training` / `races` / `vo2max` 为 None 时与 `days` 同天数；
+    显式传 0 则不写对应分片，用于验证「缺这份数据也能正常索引」。
     """
     path = root / "export.zip"
     payload = [{"summarizedActivitiesExport": [
@@ -72,6 +75,32 @@ def build_archive(
             ),
         )
     ]
+    race_count = days if races is None else races
+    # 与训练状态同样的情形：同一天两条预测，数值不同，晚的那条才是定稿
+    race = [
+        item
+        for i in range(race_count)
+        for item in (
+            make_prediction(
+                calendarDate=f"2026-07-{20 + i:02d}",
+                timestamp=f"2026-07-{20 + i:02d}T00:00:00.0",
+                raceTime5K=1092,
+            ),
+            make_prediction(
+                calendarDate=f"2026-07-{20 + i:02d}",
+                timestamp=f"2026-07-{20 + i:02d}T12:00:00.0",
+                raceTime5K=1086,
+            ),
+        )
+    ]
+    vo2_count = days if vo2max is None else vo2max
+    vo2 = [
+        make_vo2max(
+            calendarDate=f"2026-07-{20 + i:02d}",
+            updateTimestamp=f"2026-07-{20 + i:02d}T07:00:00.0",
+        )
+        for i in range(vo2_count)
+    ]
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr(
             "DI_CONNECT/DI-Connect-Fitness/9000_1_summarizedActivities.json",
@@ -91,6 +120,16 @@ def build_archive(
                 "DI_CONNECT/DI-Connect-Metrics/TrainingHistory_2026-07-20_2026-07-30_9000.json",
                 json.dumps(train),
             )
+        if race:
+            zf.writestr(
+                "DI_CONNECT/DI-Connect-Metrics/RunRacePredictions_2026-07-20_2026-07-30_999.json",
+                json.dumps(race),
+            )
+        if vo2:
+            zf.writestr(
+                "DI_CONNECT/DI-Connect-Metrics/MetricsMaxMetData_2026-07-20_2026-07-30_999.json",
+                json.dumps(vo2),
+            )
     return path
 
 
@@ -107,17 +146,47 @@ def test_index_builds_both_tables(tmp_path: Path, capsys) -> None:
 
     out = capsys.readouterr().out
     assert "活动分片" in out and "日汇总分片" in out and "睡眠分片" in out
-    assert "训练分片" in out
+    assert "训练分片" in out and "比赛预测" in out and "最大摄氧量" in out
     assert "库内活动   2 条" in out
     assert "库内日汇总 2 天" in out
     assert "库内睡眠   2 晚" in out
     assert "库内训练   2 天" in out
+    assert "库内预测   2 天" in out
+    assert "库内摄氧量 2 天" in out
 
     with Store(cfg.db_path) as store:
         assert store.count_activities() == 2
         assert store.count_days() == 2
         assert store.count_sleeps() == 2
         assert store.count_training() == 2
+        assert store.count_race_predictions() == 2
+        assert store.count_vo2max() == 2
+
+
+def test_index_merges_same_day_race_snapshots(tmp_path: Path) -> None:
+    """同一天两条预测，入库只留一条，且是时间更晚的那条。"""
+    cfg = make_config(tmp_path)
+    main(["--data", str(cfg.data_dir), "--cache", str(cfg.cache_dir), "index"])
+    with Store(cfg.db_path) as store:
+        assert store.count_race_predictions() == 2
+        assert [r["time_5k_s"] for r in store.query_race_predictions()] == [1086, 1086]
+
+
+def test_index_without_metrics_shards_still_works(tmp_path: Path, capsys) -> None:
+    """没有预测与摄氧量数据时只跳过，不该整体失败。"""
+    data = tmp_path / "data"
+    data.mkdir()
+    build_archive(data, races=0, vo2max=0)
+    cfg = Config(data_dir=data, cache_dir=tmp_path / "cache")
+
+    assert main(["--data", str(cfg.data_dir), "--cache", str(cfg.cache_dir), "index"]) == 0
+    out = capsys.readouterr().out
+    assert "归档中没有 RunRacePredictions_*.json" in out
+    assert "归档中没有 MetricsMaxMetData_*.json" in out
+    with Store(cfg.db_path) as store:
+        assert store.count_race_predictions() == 0
+        assert store.count_vo2max() == 0
+        assert store.count_activities() == 2
 
 
 def test_index_merges_same_day_training_snapshots(tmp_path: Path) -> None:
@@ -208,6 +277,8 @@ def test_doctor_reports_counts(tmp_path: Path, capsys) -> None:
     assert "每日汇总   2 天" in out
     assert "睡眠       2 晚" in out
     assert "训练状态   2 天" in out
+    assert "比赛预测   2 天" in out
+    assert "最大摄氧量 2 天" in out
     assert "一切就绪" in out
 
 
