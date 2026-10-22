@@ -17,9 +17,10 @@ from pathlib import Path
 from typing import Iterable
 
 from .parser.activities import Activity
+from .parser.daily import DailyStat
 from .privacy import pseudo_activity_id
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _META_SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -74,6 +75,54 @@ CREATE INDEX IF NOT EXISTS idx_activities_date   ON activities(date);
 CREATE INDEX IF NOT EXISTS idx_activities_sport  ON activities(sport);
 CREATE INDEX IF NOT EXISTS idx_activities_pseudo ON activities(pseudo_id);
 """
+
+# 每日汇总（UDS）。主键就是日历日，与 activities.date 同一套本地日期口径，
+# 因此「某天有没有记录」可以直接和活动表对照。
+_DAYS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS days (
+    date                 TEXT PRIMARY KEY,
+    steps                INTEGER,
+    step_goal            INTEGER,
+    distance_m           REAL,
+    moderate_min         INTEGER,
+    vigorous_min         INTEGER,
+    intensity_goal_min   INTEGER,
+    resting_hr           INTEGER,
+    min_hr               INTEGER,
+    max_hr               INTEGER,
+    calories_total       REAL,
+    calories_active      REAL,
+    calories_bmr         REAL,
+    stress_avg           INTEGER,
+    stress_max           INTEGER,
+    stress_off_wrist_min INTEGER,
+    stress_rest_s        INTEGER,
+    stress_low_s         INTEGER,
+    stress_medium_s      INTEGER,
+    stress_high_s        INTEGER,
+    bb_charged           INTEGER,
+    bb_drained           INTEGER,
+    bb_high              INTEGER,
+    bb_low               INTEGER,
+    bb_start             INTEGER,
+    bb_end               INTEGER,
+    bb_high_at           TEXT,
+    bb_low_at            TEXT,
+    user_profile_id      INTEGER,
+    source               TEXT
+);
+"""
+
+_DAY_COLUMNS = (
+    "date", "steps", "step_goal", "distance_m",
+    "moderate_min", "vigorous_min", "intensity_goal_min",
+    "resting_hr", "min_hr", "max_hr",
+    "calories_total", "calories_active", "calories_bmr",
+    "stress_avg", "stress_max", "stress_off_wrist_min",
+    "stress_rest_s", "stress_low_s", "stress_medium_s", "stress_high_s",
+    "bb_charged", "bb_drained", "bb_high", "bb_low", "bb_start", "bb_end",
+    "bb_high_at", "bb_low_at", "user_profile_id", "source",
+)
 
 _COLUMNS = (
     "activity_id", "pseudo_id", "sport", "name", "utc_start", "local_start", "date",
@@ -157,6 +206,56 @@ def _row_tuple(act: Activity, source: str) -> tuple[object, ...]:
     )
 
 
+def _day_tuple(day: DailyStat, source: str) -> tuple[object, ...]:
+    return (
+        day.date, day.steps, day.step_goal, day.distance_m,
+        day.moderate_min, day.vigorous_min, day.intensity_goal_min,
+        day.resting_hr, day.min_hr, day.max_hr,
+        day.calories_total, day.calories_active, day.calories_bmr,
+        day.stress_avg, day.stress_max, day.stress_off_wrist_min,
+        day.stress_rest_s, day.stress_low_s, day.stress_medium_s, day.stress_high_s,
+        day.bb_charged, day.bb_drained, day.bb_high, day.bb_low,
+        day.bb_start, day.bb_end,
+        _iso(day.bb_high_at), _iso(day.bb_low_at),
+        day.user_profile_id, source,
+    )
+
+
+def row_to_daily(row: sqlite3.Row) -> DailyStat:
+    """把 days 表的行还原成 DailyStat，供 privacy 层统一格式化。"""
+    return DailyStat(
+        date=row["date"],
+        steps=row["steps"],
+        step_goal=row["step_goal"],
+        distance_m=row["distance_m"],
+        moderate_min=row["moderate_min"],
+        vigorous_min=row["vigorous_min"],
+        intensity_goal_min=row["intensity_goal_min"],
+        resting_hr=row["resting_hr"],
+        min_hr=row["min_hr"],
+        max_hr=row["max_hr"],
+        calories_total=row["calories_total"],
+        calories_active=row["calories_active"],
+        calories_bmr=row["calories_bmr"],
+        stress_avg=row["stress_avg"],
+        stress_max=row["stress_max"],
+        stress_off_wrist_min=row["stress_off_wrist_min"],
+        stress_rest_s=row["stress_rest_s"],
+        stress_low_s=row["stress_low_s"],
+        stress_medium_s=row["stress_medium_s"],
+        stress_high_s=row["stress_high_s"],
+        bb_charged=row["bb_charged"],
+        bb_drained=row["bb_drained"],
+        bb_high=row["bb_high"],
+        bb_low=row["bb_low"],
+        bb_start=row["bb_start"],
+        bb_end=row["bb_end"],
+        bb_high_at=_parse_dt(row["bb_high_at"]),
+        bb_low_at=_parse_dt(row["bb_low_at"]),
+        user_profile_id=row["user_profile_id"],
+    )
+
+
 class Store:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -166,10 +265,14 @@ class Store:
         self._conn.executescript(_META_SCHEMA)
         self._migrate()
         self._conn.executescript(_SCHEMA)
+        self._conn.executescript(_DAYS_SCHEMA)
         self._conn.commit()
 
-    # 结构自愈的判据：这些列缺失即视为旧表
-    _REQUIRED_COLUMNS = frozenset({"pseudo_id", "sport", "date", "distance_m"})
+    # 结构自愈的判据：每张表缺了这些列就视为旧表
+    _REQUIRED_COLUMNS = {
+        "activities": frozenset({"pseudo_id", "sport", "date", "distance_m"}),
+        "days": frozenset({"date", "steps", "resting_hr", "stress_avg"}),
+    }
 
     def _migrate(self) -> None:
         """索引随时可从 data/ 重建，因此结构不符时直接丢弃旧表，不做增量迁移。
@@ -178,13 +281,15 @@ class Store:
         一旦元数据写着新版本而表仍是旧的，只查版本号就永远修不好
         （曾因此出现 `no such column: pseudo_id`）。
         """
-        exists = self._conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='activities'"
-        ).fetchone()
-        if exists is not None:
-            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(activities)")}
-            if not self._REQUIRED_COLUMNS.issubset(cols):
-                self._conn.executescript("DROP TABLE IF EXISTS activities;")
+        for table, required in self._REQUIRED_COLUMNS.items():
+            exists = self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if exists is None:
+                continue
+            cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            if not required.issubset(cols):
+                self._conn.executescript(f"DROP TABLE IF EXISTS {table};")
         self._conn.commit()
         self.set_meta("schema_version", str(SCHEMA_VERSION))
 
@@ -214,6 +319,21 @@ class Store:
             self._conn.executemany(sql, rows)
         return len(rows)
 
+    def upsert_days(self, days: Iterable[DailyStat], source: str) -> int:
+        """幂等写入每日汇总，返回写入的行数。"""
+        placeholders = ", ".join("?" * len(_DAY_COLUMNS))
+        sql = (
+            f"INSERT INTO days ({', '.join(_DAY_COLUMNS)}) VALUES ({placeholders}) "
+            "ON CONFLICT(date) DO UPDATE SET "
+            + ", ".join(f"{c}=excluded.{c}" for c in _DAY_COLUMNS if c != "date")
+        )
+        rows = [_day_tuple(d, source) for d in days]
+        if not rows:
+            return 0
+        with self._conn:
+            self._conn.executemany(sql, rows)
+        return len(rows)
+
     def set_meta(self, key: str, value: str) -> None:
         with self._conn:
             self._conn.execute(
@@ -230,6 +350,49 @@ class Store:
 
     def count_activities(self) -> int:
         return self._conn.execute("SELECT COUNT(*) AS n FROM activities").fetchone()["n"]
+
+    def count_days(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) AS n FROM days").fetchone()["n"]
+
+    def query_days(
+        self,
+        start: str | date | None = None,
+        end: str | date | None = None,
+        limit: int | None = None,
+        order: str = "asc",
+    ) -> list[sqlite3.Row]:
+        """按日期区间（含端点）取每日汇总。
+
+        默认升序：日汇总的主要用途是看趋势，时间正序才读得出来。
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        if start is not None:
+            clauses.append("date >= ?")
+            params.append(str(start))
+        if end is not None:
+            clauses.append("date <= ?")
+            params.append(str(end))
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        direction = "DESC" if order.lower() == "desc" else "ASC"
+        sql = f"SELECT * FROM days {where} ORDER BY date {direction}"
+        if order.lower() == "desc" and limit:
+            # 先取最近 N 天，再翻回正序，语义才是「最近 N 天的趋势」
+            sql += " LIMIT ?"
+            params.append(int(limit))
+            rows = self._conn.execute(sql, params).fetchall()
+            return list(reversed(rows))
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return self._conn.execute(sql, params).fetchall()
+
+    def day_range(self) -> tuple[str | None, str | None]:
+        row = self._conn.execute(
+            "SELECT MIN(date) AS lo, MAX(date) AS hi FROM days"
+        ).fetchone()
+        return (row["lo"], row["hi"]) if row else (None, None)
 
     def query_activities(
         self,

@@ -7,15 +7,23 @@ from pathlib import Path
 import pytest
 
 from garmaple.parser.activities import parse_activity
-from garmaple.store import Store
+from garmaple.parser.daily import parse_daily
+from garmaple.store import Store, row_to_daily
 
 from .test_activities import make_raw
+from .test_daily import make_block
 
 
 def act(activity_id: int, **overrides: object):
     a = parse_activity(make_raw(activityId=activity_id, **overrides))
     assert a is not None
     return a
+
+
+def day(calendar_date: str, **overrides: object):
+    d = parse_daily(make_block(calendarDate=calendar_date, **overrides))
+    assert d is not None
+    return d
 
 
 @pytest.fixture()
@@ -191,3 +199,110 @@ def test_broken_table_self_heals_even_if_version_looks_new(tmp_path: Path) -> No
         assert s.count_activities() == 0
         assert s.upsert_activities([act(7)], source="x") == 1
         assert s.count_activities() == 1
+
+
+# ---------------- days 表 ----------------
+
+def test_days_upsert_and_count(tmp_path: Path) -> None:
+    with Store(tmp_path / "d.sqlite3") as s:
+        assert s.upsert_days([day("2026-07-24"), day("2026-07-25")], source="x") == 2
+        assert s.count_days() == 2
+
+
+def test_days_upsert_is_idempotent(tmp_path: Path) -> None:
+    with Store(tmp_path / "d.sqlite3") as s:
+        s.upsert_days([day("2026-07-24")], source="x")
+        s.upsert_days([day("2026-07-24", totalSteps=1)], source="x")
+        assert s.count_days() == 1
+        row = s.query_days()[0]
+        assert row["steps"] == 1
+
+
+def test_days_query_is_ascending_by_default(tmp_path: Path) -> None:
+    with Store(tmp_path / "d.sqlite3") as s:
+        s.upsert_days([day("2026-07-25"), day("2026-07-23"), day("2026-07-24")], source="x")
+        assert [r["date"] for r in s.query_days()] == [
+            "2026-07-23", "2026-07-24", "2026-07-25",
+        ]
+
+
+def test_days_date_range_is_inclusive(tmp_path: Path) -> None:
+    with Store(tmp_path / "d.sqlite3") as s:
+        s.upsert_days([day("2026-07-23"), day("2026-07-24"), day("2026-07-25")], source="x")
+        rows = s.query_days(start="2026-07-24", end="2026-07-25")
+        assert [r["date"] for r in rows] == ["2026-07-24", "2026-07-25"]
+        assert s.query_days(start="2099-01-01") == []
+
+
+def test_days_limit_desc_returns_most_recent_in_order(tmp_path: Path) -> None:
+    """「最近 2 天」应是最新那两天，且仍按时间正序返回。"""
+    with Store(tmp_path / "d.sqlite3") as s:
+        s.upsert_days(
+            [day("2026-07-22"), day("2026-07-23"), day("2026-07-24"), day("2026-07-25")],
+            source="x",
+        )
+        rows = s.query_days(limit=2, order="desc")
+        assert [r["date"] for r in rows] == ["2026-07-24", "2026-07-25"]
+
+
+def test_days_limit_asc(tmp_path: Path) -> None:
+    with Store(tmp_path / "d.sqlite3") as s:
+        s.upsert_days([day("2026-07-23"), day("2026-07-24")], source="x")
+        assert [r["date"] for r in s.query_days(limit=1)] == ["2026-07-23"]
+
+
+def test_day_range(tmp_path: Path) -> None:
+    with Store(tmp_path / "d.sqlite3") as s:
+        s.upsert_days([day("2026-07-23"), day("2026-07-25")], source="x")
+        assert s.day_range() == ("2026-07-23", "2026-07-25")
+
+
+def test_day_range_on_empty_table(tmp_path: Path) -> None:
+    with Store(tmp_path / "d.sqlite3") as s:
+        assert s.day_range() == (None, None)
+
+
+def test_days_roundtrip_keeps_values_and_local_times(tmp_path: Path) -> None:
+    from datetime import datetime
+
+    with Store(tmp_path / "d.sqlite3") as s:
+        s.upsert_days([day("2026-07-24")], source="x")
+        restored = row_to_daily(s.query_days()[0])
+    assert restored.steps == 9523
+    assert restored.stress_avg == 33
+    assert restored.intensity_minutes == 30 + 2 * 18
+    assert restored.bb_high_at == datetime(2026, 7, 24, 10, 57)
+    assert restored.bb_low_at == datetime(2026, 7, 24, 0, 1)
+
+
+def test_days_and_activities_coexist(tmp_path: Path) -> None:
+    """两张表互不影响：写日汇总不该动活动索引。"""
+    with Store(tmp_path / "d.sqlite3") as s:
+        s.upsert_activities([act(1)], source="x")
+        s.upsert_days([day("2026-07-24")], source="x")
+        assert s.count_activities() == 1
+        assert s.count_days() == 1
+
+
+def test_broken_days_table_self_heals(tmp_path: Path) -> None:
+    """旧库里的 days 表若缺列（例如只见过早期骨架），打开时应重建。"""
+    import sqlite3
+
+    path = tmp_path / "old-days.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE days (date TEXT PRIMARY KEY, steps INTEGER);
+        CREATE TABLE activities (activity_id INTEGER PRIMARY KEY, pseudo_id TEXT,
+                                 sport TEXT, date TEXT, distance_m REAL);
+        INSERT INTO days VALUES ('2026-07-24', 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as s:
+        cols = {r[1] for r in s._conn.execute("PRAGMA table_info(days)")}
+        assert "stress_avg" in cols
+        assert s.count_days() == 0  # 旧表被丢弃，等下次 index 重灌
+        assert s.upsert_days([day("2026-07-24")], source="x") == 1
