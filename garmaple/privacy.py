@@ -85,6 +85,23 @@ class Privacy:
             return dt.replace(tzinfo=None).isoformat(sep=" ", timespec="seconds")
         return dt.date().isoformat()
 
+    def _safe_name(self, act: Activity) -> str | None:
+        """strict/normal 下剥离活动名称里的地点。
+
+        佳明会自动把活动命名为「城市 + 运动类型」（实测形如「深圳市 跑步」）。
+        如果只过滤 location_name 而放过 name，等于绕过了这道限制——
+        这是实测真实数据时才发现的。
+        """
+        name = act.name
+        if not name:
+            return None
+        if self.allows_location:
+            return name
+        if act.location_name and act.location_name in name:
+            cleaned = name.replace(act.location_name, "").strip(" -·—,，")
+            return cleaned or None
+        return name
+
     def _strip_none(self, data: dict[str, object]) -> dict[str, object]:
         """去掉 None 与空列表，避免返回值被大量 null 撑大。"""
         return {
@@ -103,7 +120,7 @@ class Privacy:
         out: dict[str, object] = {
             "id": self.public_id(act.activity_id),
             "sport": act.sport,
-            "name": act.name,
+            "name": self._safe_name(act),
             "when": self.when(act.utc_start, act.local_start),
             "distance_km": dist_km,
             "duration_s": round(act.duration_s) if act.duration_s is not None else None,
@@ -116,8 +133,10 @@ class Privacy:
             "elevation_gain_m": (
                 round(act.elevation_gain_m) if act.elevation_gain_m is not None else None
             ),
-            "aerobic_te": act.aerobic_te,
-            "anaerobic_te": act.anaerobic_te,
+            "aerobic_te": round(act.aerobic_te, 1) if act.aerobic_te is not None else None,
+            "anaerobic_te": (
+                round(act.anaerobic_te, 1) if act.anaerobic_te is not None else None
+            ),
             "vo2max": act.vo2max,
             "cadence_spm": act.cadence_spm,
             "stride_length_cm": (

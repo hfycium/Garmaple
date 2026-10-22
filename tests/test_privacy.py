@@ -124,3 +124,48 @@ def test_utc_start_timezone_is_aware() -> None:
     act = make_activity()
     assert act.utc_start is not None
     assert act.utc_start.tzinfo == timezone.utc
+
+
+# ---------- 活动名称里的地点泄露 ----------
+
+
+def test_strict_strips_city_from_auto_generated_name() -> None:
+    """佳明自动命名形如「深圳市 跑步」，只过滤 location_name 会漏掉这里。"""
+    out = Privacy("strict").activity(make_activity(name="深圳市 跑步", locationName="深圳市"))
+    assert out["name"] == "跑步"
+    assert "深圳" not in str(out)
+
+
+def test_strict_keeps_user_defined_name() -> None:
+    out = Privacy("strict").activity(make_activity(name="晨跑", locationName="深圳市"))
+    assert out["name"] == "晨跑"
+
+
+def test_strict_drops_name_when_only_city_remains() -> None:
+    out = Privacy("strict").activity(make_activity(name="深圳市", locationName="深圳市"))
+    assert "name" not in out
+
+
+def test_normal_also_strips_city() -> None:
+    out = Privacy("normal").activity(make_activity(name="深圳市 跑步", locationName="深圳市"))
+    assert out["name"] == "跑步"
+
+
+def test_raw_keeps_full_name() -> None:
+    out = Privacy("raw").activity(make_activity(name="深圳市 跑步", locationName="深圳市"))
+    assert out["name"] == "深圳市 跑步"
+
+
+@pytest.mark.parametrize("level", ["strict", "normal", "raw"])
+def test_name_without_location_untouched(level: str) -> None:
+    out = Privacy(level).activity(make_activity(name="节奏跑 5x1km", locationName=None))
+    assert out["name"] == "节奏跑 5x1km"
+
+
+# ---------- 浮点噪音 ----------
+
+
+def test_training_effect_is_rounded() -> None:
+    """原始值形如 0.10000000149011612，直接返回会污染上下文。"""
+    out = Privacy("strict").activity(make_activity(anaerobicTrainingEffect=0.10000000149011612))
+    assert out["anaerobic_te"] == 0.1
