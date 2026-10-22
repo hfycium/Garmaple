@@ -20,7 +20,7 @@ classifiers = [
 ]
 dependencies = [
     "fitdecode>=0.10.0",
-    "mcp>=1.0.0",
+    "mcp>=2.0.0",
 ]
 
 [project.optional-dependencies]

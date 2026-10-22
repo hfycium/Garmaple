@@ -78,7 +78,7 @@ def summarize(rows: Iterable[Mapping[str, Any] | Any]) -> dict[str, Any]:
                 "date": _get(row, "date"),
                 "sport": sport,
                 "distance_m": dist,
-                "duration_s": dur,
+                "duration_s": round(dur),
             }
 
         # 只看距离足够的记录，避免几百米的热身被当成最快配速
