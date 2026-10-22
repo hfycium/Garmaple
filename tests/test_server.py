@@ -53,7 +53,8 @@ def test_daily_summary_tool_is_registered(tmp_path: Path) -> None:
     assert "get_hr_zones" in names
     assert "get_activity_streams" in names
     assert "get_pace_hr_drift" in names
-    assert len(names) == 14
+    assert "get_training_load" in names
+    assert len(names) == 15
 
 
 def test_hr_zones_distribution(tmp_path: Path) -> None:
@@ -367,6 +368,62 @@ def test_overview_reports_training_coverage(tmp_path: Path) -> None:
     assert out["training_status"]["date_from"] == "2026-07-20"
     assert out["training_status"]["date_to"] == "2026-07-22"
     assert "CTL" in out["training_status"]["note"]
+
+
+# ---------------- get_training_load ----------------
+
+
+def test_training_load_without_tss_returns_unavailable(tmp_path: Path) -> None:
+    """本机设备不写 TSS（304 活动全空），tool 必须诚实返回 available: false。"""
+    out = call(prepared(tmp_path, fits=2), "get_training_load", {})
+    assert out["available"] is False
+    assert out["reason"] == "no_tss_data"
+    assert "get_training_status" in out["hint"]
+
+
+def test_training_load_with_tss_computes_ctl_atl_tsb(tmp_path: Path) -> None:
+    """合成 TSS=50 的 FIT，验证 CTL/ATL/TSB 能算出来。fits=1 确保单次。"""
+    out = call(prepared(tmp_path, fits=1, tss=50.0), "get_training_load", {})
+    assert out["available"] is True
+    assert out["count"] >= 1
+    day = out["days"][0]
+    assert day["tss"] == 50.0
+    assert day["ctl"] > 0
+    assert day["atl"] > 0
+    assert "tsb" in day
+    assert out["latest"]["date"] == out["days"][-1]["date"]
+
+
+def test_training_load_date_range_filter(tmp_path: Path) -> None:
+    """日期过滤要生效。合成 TSS 在活动日（2025-02-19）附近。"""
+    out = call(
+        prepared(tmp_path, fits=1, tss=50.0),
+        "get_training_load",
+        {"start_date": "2025-02-18", "end_date": "2025-02-20"},
+    )
+    assert out["available"] is True
+    assert out["count"] >= 1
+    assert out["range"]["from"] >= "2025-02-18"
+    assert out["range"]["to"] <= "2025-02-20"
+
+
+def test_training_load_limit_truncates_to_recent(tmp_path: Path) -> None:
+    out = call(
+        prepared(tmp_path, fits=2, tss=50.0),
+        "get_training_load",
+        {"limit": 1},
+    )
+    assert out["count"] == 1
+    assert out.get("truncated") is True or out["count"] <= 1
+
+
+def test_training_load_rejects_bad_dates(tmp_path: Path) -> None:
+    with pytest.raises((ToolError, UnexpectedToolError)):
+        call(
+            prepared(tmp_path, fits=2, tss=50.0),
+            "get_training_load",
+            {"start_date": "2026-07-22", "end_date": "2026-07-20"},
+        )
 
 
 # ---------------- get_race_predictions ----------------

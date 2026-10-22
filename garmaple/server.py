@@ -21,6 +21,7 @@ from .stats import (
     human_pace,
     pace_hr_drift,
     summarize,
+    training_load_series,
     zone_summary,
 )
 from .streams import find_stream
@@ -53,13 +54,15 @@ INSTRUCTIONS = """\
 最大摄氧量、个人最佳纪录、装备里程、以及从原始 .fit 解析出的逐秒曲线
 （心率、配速、海拔、步频；覆盖大部分活动但不是全部）。
 
-七点必须注意：
+八点必须注意：
 - 睡眠记录按**醒来日**归档。问「昨晚睡得怎么样」要查今天那条，
   查昨天会拿到前一晚的数据。
-- 官方导出包里没有睡眠评分数值，也没有 CTL / ATL / TSB 三个体能指标。
-  训练状态与周训练负荷是设备自己判定的结果，
-  与 Connect 上显示的一致，但不要把它当成 CTL 用，也不要自行换算。
-  被问到时直接说明当前没有这项能力，不要猜测或估算数值。
+- 官方导出包里没有睡眠评分数值。
+- CTL / ATL / TSB 用 get_training_load 查询，输入是 FIT session 的
+  `training_stress_score`（TSS）。这是 FIT 标准字段，但**不是所有设备都写**
+  ——本机设备 304 次活动一次没写过，有功率计的设备才会有。
+  查不到 TSS 时 tool 会返回 available: false，不要拿训练效果（TE）或
+  周训练负荷去近似——量纲不同，拼出来的值和佳明的不是一回事。
 - 逐秒曲线是真实采样，不是插值。但它**只覆盖有 .fit 文件的活动**，
   查不到时不要下结论说「那次没记录心率」——先看 get_activity 的汇总值。
   曲线返回的 `series` 是抽稀后的（默认 300 点），极值以 `summary` 为准。
@@ -185,7 +188,7 @@ def build_server(cfg: Config) -> Any:
                     "days": training_count,
                     "date_from": tlo,
                     "date_to": thi,
-                    "note": "设备判定的结果；不含 CTL / ATL / TSB",
+                    "note": "设备判定的结果；CTL/ATL/TSB 另见 get_training_load",
                 }
             race_count = store.count_race_predictions()
             if race_count:
@@ -664,8 +667,9 @@ def build_server(cfg: Config) -> Any:
            不是「没练好」，不要把它归到负面状态里。
         2. `load_position` 是周训练负荷相对 `load_tunnel`（最优负荷区间）的位置，
            取 below / in / above。低于区间不等于退步——恢复周本就该低。
-        3. 归档里**没有 CTL / ATL / TSB**。`weekly_load` 是佳明的周负荷累计值，
-           与 CTL 不是同一个量：不要当作体能值使用，也不要自行换算。
+        3. `weekly_load` 是佳明的周负荷累计值，与 CTL 不是同一个量。
+           CTL / ATL / TSB 用 get_training_load 查（需要设备写 TSS），
+           不要拿 weekly_load 当体能值使用，也不要自行换算。
         4. 一天一条。设备一天会写多条同步快照，这里只留当日最后一次。
 
         参数：
@@ -720,6 +724,102 @@ def build_server(cfg: Config) -> Any:
             if truncated:
                 result["truncated"] = True
                 result["note"] = f"区间内记录多于 {capped} 天，只返回最近 {capped} 天"
+            return result
+
+    @mcp.tool()
+    def get_training_load(
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: int = 90,
+    ) -> dict[str, Any]:
+        """训练负荷趋势：CTL（体能）、ATL（疲劳）、TSB（状态）。
+
+        输入是 FIT `session` 消息的 `training_stress_score`（TSS）。
+        逐日 TSS 做指数平滑：CTL 用 42 天 EMA、ATL 用 7 天 EMA、
+        TSB = CTL − ATL。正 TSB 表示恢复充分，负 TSB 表示欠恢复。
+
+        四点必须知道：
+        - **TSS 是 FIT 标准字段，但不是所有设备都写。** 戴功率计或
+          高端手表的导出会写满；本机老设备 304 次活动全空。
+          没有 TSS 时 tool 返回 `available: false`，不要拿训练效果（TE）
+          或周训练负荷近似——量纲不同。
+        - **CTL/ATL 是累积值，冷启动偏低。** 前 42 天 CTL 持续爬升
+          （42 天后约到稳态值的 63%），不是「体能在涨」，是历史数据不够。
+          要看趋势变化，关注**相对变化**而不是绝对值。
+        - **TSB 正数 = 恢复充分，负数 = 欠恢复。** 这是 CTL − ATL 的
+          算术差，不是设备的「训练状态」判定（那是 get_training_status）。
+        - **日期缺口自动补 0。** 没训练的日子 TSS 为零参与平滑。
+
+        参数：
+            start_date / end_date: YYYY-MM-DD，含端点，均可省略
+            limit: 最多返回天数，默认 90，上限 365
+
+        结果按日期正序：
+            days     趋势数组（date / tss / ctl / atl / tsb）
+            latest   最后一天，回答「我现在体能怎么样」直接用它
+        """
+        capped = max(1, min(int(limit or 90), 365))
+        start = _date(start_date, "start_date")
+        end = _date(end_date, "end_date")
+        if start and end and start > end:
+            raise ToolError("start_date 不能晚于 end_date")
+
+        with _store() as store:
+            tss_count = store.count_fit_loads()
+            if not tss_count:
+                return {
+                    "available": False,
+                    "reason": "no_tss_data",
+                    "hint": (
+                        "归档里没有 TSS（training_stress_score）数据。"
+                        "这是 FIT session 的标准字段，需要设备写入——"
+                        "有功率计或高端手表的导出才有。"
+                        "本机设备不写 TSS，无法计算 CTL/ATL/TSB。"
+                        "可以改用 get_training_status 看训练状态与周训练负荷。"
+                    ),
+                }
+
+            full_series = training_load_series(store.daily_tss())
+            if not full_series:
+                return {
+                    "available": False,
+                    "reason": "no_tss_data",
+                    "hint": "TSS 数据存在但无法与活动日期对齐，请重跑 garmaple index",
+                }
+
+            # 先按请求窗口过滤，再截断到 limit
+            if start:
+                full_series = [d for d in full_series if d["date"] >= start]
+            if end:
+                full_series = [d for d in full_series if d["date"] <= end]
+
+            truncated = len(full_series) > capped
+            if truncated:
+                full_series = full_series[-capped:]
+
+            if not full_series:
+                return {
+                    "available": True,
+                    "count": 0,
+                    "days": [],
+                    "hint": "该区间没有 TSS 数据。可用 get_data_overview 确认覆盖范围",
+                }
+
+            result: dict[str, Any] = {
+                "available": True,
+                "count": len(full_series),
+                "range": {"from": full_series[0]["date"], "to": full_series[-1]["date"]},
+                "latest": full_series[-1],
+                "days": full_series,
+                "note": (
+                    "CTL=42 天 EMA、ATL=7 天 EMA、TSB=CTL−ATL。"
+                    "TSS 来自 FIT session 的 training_stress_score 字段。"
+                    "前 42 天 CTL 冷启动偏低（约到稳态 63%），看趋势变化别看绝对值。"
+                ),
+            }
+            if truncated:
+                result["truncated"] = True
+                result["note"] += f" 区间超 {capped} 天，只返回最近 {capped} 天"
             return result
 
     @mcp.tool()

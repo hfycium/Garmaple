@@ -53,6 +53,7 @@ def build_archive(
     workout_rpe: int | None = None,
     workout_feel: int | None = None,
     power_w: int | None = None,
+    tss: float | None = None,
 ) -> Path:
     """造一个最小导出包：活动 + 日汇总 + 睡眠 + 训练 + 预测 + 摄氧量 + 纪录 + 装备。
 
@@ -62,6 +63,9 @@ def build_archive(
 
     `superseded=True` 时额外写一条被刷新过的旧纪录（current=false），
     用于验证「当前纪录」与「历史纪录」不会混在一起。
+
+    `tss` 是写进每个 FIT session 的训练负荷（training_stress_score）。
+    默认 None（不写），对应本机设备的实际行为。
     """
     path = root / "export.zip"
     payload = [{"summarizedActivitiesExport": [
@@ -213,6 +217,7 @@ def build_archive(
                             start=base,
                             workout_rpe=workout_rpe,
                             workout_feel=workout_feel,
+                            training_stress_score=tss,
                             samples=[
                                 sample_at(
                                     base,
