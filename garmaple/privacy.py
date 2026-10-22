@@ -19,6 +19,7 @@ from datetime import datetime
 
 from .parser.activities import Activity
 from .parser.daily import DailyStat
+from .parser.sleep import SleepRecord
 
 # 固定盐值：让伪 ID 在多次会话间保持稳定，又不直接暴露 activityId
 _ID_SALT = "garmaple-v1"
@@ -100,6 +101,16 @@ class Privacy:
         if dt is None or not self.allows_precise_time:
             return None
         return dt.strftime("%H:%M")
+
+    def _moment(self, dt: datetime | None) -> str | None:
+        """睡眠的入睡 / 醒来时刻，精确到分钟。
+
+        这是**作息规律**的直接刻画（几点睡、几点起），比活动的开始时间
+        更敏感，因此与 `allows_precise_time` 同档：strict 下一律不给。
+        """
+        if dt is None or not self.allows_precise_time:
+            return None
+        return dt.replace(tzinfo=None).isoformat(sep=" ", timespec="minutes")
 
     def _safe_name(self, act: Activity) -> str | None:
         """strict/normal 下剥离活动名称里的地点。
@@ -217,4 +228,37 @@ class Privacy:
         if self.allows_identity:
             out["user_profile_id"] = d.user_profile_id
 
+        return self._strip_none(out)
+
+    def sleep(self, rec: SleepRecord) -> dict[str, object]:
+        """单晚睡眠。
+
+        `date` 是**醒来那天**：一晚的睡眠记在醒来日，问「昨晚睡得怎样」
+        要查今天的记录。这个语义由工具说明负责讲清楚，这里只如实输出。
+
+        strict 下丢掉入睡 / 醒来时刻——那是最直接的作息画像；时长与分期
+        是聚合量，保留。没有有效分期的那一晚只返回 `date` 与 `status`，
+        时长留空：摘表（off_wrist）和未确认（unconfirmed）都不是「睡了 0 分钟」。
+        """
+        asleep_min = rec.asleep_min
+        out: dict[str, object] = {
+            "date": rec.date,
+            "status": rec.status,
+            "asleep_min": asleep_min,
+            "asleep_h": round(asleep_min / 60.0, 2) if asleep_min is not None else None,
+            "in_bed_min": rec.in_bed_min,
+            "deep_min": rec.deep_min,
+            "light_min": rec.light_min,
+            "rem_min": rec.rem_min,
+            "awake_min": rec.awake_min,
+            "respiration_avg": (
+                round(rec.respiration_avg, 1) if rec.respiration_avg is not None else None
+            ),
+        }
+        # 只有确认有分期的记录才给时刻：摘表那晚的 start/end 其实是「摘下手表」
+        # 与「戴回手表」的时间，未确认睡眠窗的是固定占位值，都会被误读成作息。
+        if rec.has_stages:
+            out["fell_asleep_at"] = self._moment(rec.start_at)
+            out["woke_at"] = self._moment(rec.end_at)
+        out["retro"] = rec.retro or None
         return self._strip_none(out)

@@ -231,3 +231,68 @@ def test_day_calories_are_rounded() -> None:
 
 def test_clock_returns_none_for_missing_time() -> None:
     assert Privacy("raw").clock(None) is None
+
+
+# ---------- 睡眠 ----------
+
+
+def make_sleep_record(**overrides: object):
+    from garmaple.parser.sleep import parse_sleep
+
+    from .test_sleep import make_sleep
+
+    rec = parse_sleep(make_sleep(**overrides), offset_hours=8.0)
+    assert rec is not None
+    return rec
+
+
+def off_wrist_record():
+    return make_sleep_record(
+        sleepWindowConfirmationType="OFF_WRIST",
+        deepSleepSeconds=0, lightSleepSeconds=0, remSleepSeconds=0,
+        awakeSleepSeconds=0, unmeasurableSeconds=0, averageRespiration=None,
+    )
+
+
+@pytest.mark.parametrize("level", ["strict", "normal", "raw"])
+def test_sleep_keeps_aggregates_at_every_level(level: str) -> None:
+    out = Privacy(level).sleep(make_sleep_record())
+    assert out["date"] == "2026-07-24"
+    assert out["status"] == "ok"
+    assert out["asleep_min"] == 661 - 52
+    assert out["asleep_h"] == 10.15
+    assert out["deep_min"] == 90
+    assert out["rem_min"] == 160
+
+
+def test_sleep_strict_withholds_bed_and_wake_times() -> None:
+    """几点睡几点起是最直接的作息画像，strict 下不给。"""
+    out = Privacy("strict").sleep(make_sleep_record())
+    assert "fell_asleep_at" not in out
+    assert "woke_at" not in out
+
+
+def test_sleep_normal_gives_minute_precision() -> None:
+    out = Privacy("normal").sleep(make_sleep_record())
+    assert out["fell_asleep_at"] == "2026-07-23 23:20"
+    assert out["woke_at"] == "2026-07-24 10:21"
+
+
+def test_sleep_without_stages_has_only_date_and_status() -> None:
+    """摘表那晚不能出现时长，也不能把「摘下/戴上」的时间当作息。"""
+    for level in ("strict", "normal", "raw"):
+        out = Privacy(level).sleep(off_wrist_record())
+        assert out == {"date": "2026-07-24", "status": "off_wrist"}
+
+
+def test_sleep_never_reports_zero_for_missing_stages() -> None:
+    out = Privacy("normal").sleep(off_wrist_record())
+    assert out.get("asleep_min") != 0
+    assert out.get("in_bed_min") != 0
+    assert "asleep_min" not in out  # 直接不出现，而不是置 0
+
+
+def test_sleep_drops_missing_fields() -> None:
+    out = Privacy("strict").sleep(make_sleep_record(averageRespiration=None))
+    assert "respiration_avg" not in out
+    assert "deep_min" in out
