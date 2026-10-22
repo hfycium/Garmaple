@@ -1,0 +1,132 @@
+"""脱敏层：MCP 工具返回值必须经过这里。
+
+为什么需要它：工具本身不联网，但**返回值会进入 AI 上下文并发送给模型服务商**。
+数据一旦离开本机就收不回来，因此脱敏只能发生在返回之前，不能指望 AI 侧保护。
+
+三档策略（见 README）：
+    strict  默认。无坐标、无地点名、无原始 ID、时间只到日期
+    normal  无坐标，保留原始 ID 与精确时间
+    raw     全字段，需显式开启
+
+原则是「聚合优先、默认粗化」：宁可少给 AI 一点，也不要默认交出住址。
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from datetime import datetime
+
+from .parser.activities import Activity
+
+# 固定盐值：让伪 ID 在多次会话间保持稳定，又不直接暴露 activityId
+_ID_SALT = "garmaple-v1"
+
+VALID_LEVELS = ("strict", "normal", "raw")
+
+
+@dataclass(frozen=True)
+class Privacy:
+    level: str = "strict"
+
+    def __post_init__(self) -> None:
+        if self.level not in VALID_LEVELS:
+            raise ValueError(f"未知隐私级别 {self.level!r}，可选：{', '.join(VALID_LEVELS)}")
+
+    # ---------- 判定 ----------
+
+    @property
+    def is_strict(self) -> bool:
+        return self.level == "strict"
+
+    @property
+    def allows_location(self) -> bool:
+        """地点名与坐标只在 raw 下可用。"""
+        return self.level == "raw"
+
+    @property
+    def allows_precise_time(self) -> bool:
+        return self.level != "strict"
+
+    @property
+    def allows_raw_id(self) -> bool:
+        return self.level != "strict"
+
+    # ---------- 转换 ----------
+
+    def public_id(self, activity_id: int) -> str:
+        """strict 下把 activityId 换成不可反查的伪 ID。
+
+        原始 ID 是公开活动页 URL 的一部分，泄露即可反查到用户身份，
+        因此默认不外露。
+        """
+        if self.allows_raw_id:
+            return str(activity_id)
+        digest = hashlib.blake2s(
+            f"{_ID_SALT}:{activity_id}".encode("utf-8"), digest_size=4
+        ).hexdigest()
+        return f"act_{digest}"
+
+    def when(self, utc: datetime | None, local: datetime | None) -> str | None:
+        """strict 下只到日期；更高档位给出本地完整时间。"""
+        dt = local or utc
+        if dt is None:
+            return None
+        if self.allows_precise_time:
+            return dt.replace(tzinfo=None).isoformat(sep=" ", timespec="seconds")
+        return dt.date().isoformat()
+
+    def _strip_none(self, data: dict[str, object]) -> dict[str, object]:
+        """去掉 None 与空列表，避免返回值被大量 null 撑大。"""
+        return {
+            k: v
+            for k, v in data.items()
+            if v is not None and not (isinstance(v, list) and not v)
+        }
+
+    # ---------- 实体转换 ----------
+
+    def activity(self, act: Activity) -> dict[str, object]:
+        dist_km = round(act.distance_m / 1000.0, 3) if act.distance_m is not None else None
+        pace = round(act.pace_s_per_km, 1) if act.pace_s_per_km is not None else None
+        zones = act.hr_zone_seconds if any(act.hr_zone_seconds) else None
+
+        out: dict[str, object] = {
+            "id": self.public_id(act.activity_id),
+            "sport": act.sport,
+            "name": act.name,
+            "when": self.when(act.utc_start, act.local_start),
+            "distance_km": dist_km,
+            "duration_s": round(act.duration_s) if act.duration_s is not None else None,
+            "moving_s": round(act.moving_s) if act.moving_s is not None else None,
+            "pace_s_per_km": pace,
+            "avg_speed_mps": round(act.avg_speed_mps, 2) if act.avg_speed_mps else None,
+            "avg_hr": act.avg_hr,
+            "max_hr": act.max_hr,
+            "calories": round(act.calories) if act.calories is not None else None,
+            "elevation_gain_m": (
+                round(act.elevation_gain_m) if act.elevation_gain_m is not None else None
+            ),
+            "aerobic_te": act.aerobic_te,
+            "anaerobic_te": act.anaerobic_te,
+            "vo2max": act.vo2max,
+            "cadence_spm": act.cadence_spm,
+            "stride_length_cm": (
+                round(act.stride_length_cm, 1) if act.stride_length_cm else None
+            ),
+            "lap_count": act.lap_count,
+            "hr_zones_s": zones,
+        }
+
+        if self.allows_location:
+            out.update(
+                {
+                    "location_name": act.location_name,
+                    "start": [act.start_lat, act.start_lon],
+                    "end": [act.end_lat, act.end_lon],
+                    "device_id": act.device_id,
+                    "user_profile_id": act.user_profile_id,
+                }
+            )
+
+        return self._strip_none(out)
