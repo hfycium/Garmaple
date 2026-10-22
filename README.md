@@ -76,7 +76,7 @@ Garmaple 不是实时工具，数据新鲜度取决于你上次导出的时间�
 - [ ] `get_recovery_correlation` — 睡眠 / 压力 / 身体电量与训练表现的相关性
 - [x] `get_gear_mileage` — 跑鞋装备里程预警
 
-> `get_training_load` 为什么空着：CTL / ATL / TSB 是拿**单次训练负荷**逐日累加算出来的，而单次训练负荷不在导出包里。活动摘要只有 `aerobic_te` / `anaerobic_te`（有氧 / 无氧训练效果），`TrainingHistory` 只有设备已经算好的周负荷与训练状态。缺了输入就复现不出佳明那套口径，用训练效果去近似得到的数字不是同一个东西，所以不做。
+> `get_training_load` 为什么空着：CTL / ATL / TSB 是拿**单次训练负荷**逐日累加算出来的，而这个输入在归档里拿不到。活动摘要只有 `aerobic_te` / `anaerobic_te`（有氧 / 无氧训练效果），`TrainingHistory` 只有设备已经算好的周负荷与训练状态。原始 `.fit` 里确实有 `training_stress_score`、`intensity_factor`、`normalized_power` 这三个字段，但**每一次活动的取值都是空**（逐个文件核过，没有一条填了数），所以也指望不上。缺了输入就复现不出佳明那套口径，用训练效果去近似得到的数字不是同一个东西，所以不做。
 >
 > 想看体能走向时，用 `get_training_status` 里的 `fitness_trend`（体能水平趋势）与 `load_position`（周负荷落在最优负荷区间的哪一侧）；或者直接看 `get_race_predictions` 的预测时间——那是设备按当前体能推算的能力值，比用训练效果拼出来的曲线可信。
 
