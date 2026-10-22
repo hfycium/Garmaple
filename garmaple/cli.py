@@ -327,6 +327,8 @@ def cmd_doctor(cfg: Config) -> int:
             lo, hi = store.date_range()
             print(f"活动       {n} 条")
             print(f"日期范围   {lo} → {hi}")
+            nz = store.count_activities_with_zones()
+            print(f"心率区间   {nz}/{n} 条活动有区间数据")
             nd = store.count_days()
             dlo, dhi = store.day_range()
             print(f"每日汇总   {nd} 天" + (f"（{dlo} → {dhi}）" if nd else ""))

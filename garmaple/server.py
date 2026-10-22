@@ -14,7 +14,7 @@ from .config import Config
 from .parser.metrics import RACE_DISTANCES_KM
 from .parser.records import GROUPS, GearUsage
 from .privacy import Privacy
-from .stats import human_duration, human_pace, summarize
+from .stats import human_duration, human_pace, summarize, zone_summary
 from .store import (
     Store,
     row_to_activity,
@@ -38,12 +38,12 @@ INSTRUCTIONS = """\
 不要试图推测用户住址或作息规律。若用户需要更细的数据，请提示其
 自行调整 GARMAPLE_PRIVACY 配置，而不是尝试绕过限制。
 
-当前索引包含：活动摘要、每日 wellness 汇总（步数、静息心率、压力、
-身体电量、强度分钟）、睡眠（时长与分期）、训练状态（状态判定、
-周训练负荷、负荷隧道）、比赛成绩预测（5K / 10K / 半马 / 全马）、
+当前索引包含：活动摘要（含心率区间累计时长）、每日 wellness 汇总（步数、
+静息心率、压力、身体电量、强度分钟）、睡眠（时长与分期）、训练状态（状态
+判定、周训练负荷、负荷隧道）、比赛成绩预测（5K / 10K / 半马 / 全马）、
 最大摄氧量、个人最佳纪录、装备里程。
 
-六点必须注意：
+七点必须注意：
 - 睡眠记录按**醒来日**归档。问「昨晚睡得怎么样」要查今天那条，
   查昨天会拿到前一晚的数据。
 - 官方导出包里没有睡眠评分数值，也没有 CTL / ATL / TSB 三个体能指标，
@@ -59,6 +59,8 @@ INSTRUCTIONS = """\
   `display`，否则会把 1108 秒的 5K 说成 1108 米。
 - 装备里程是由关联活动的距离求和得到的。某双装备没有关联记录
   只代表**归档里没记**，不等于没跑过，不要报 0 公里。
+- 心率区间只有**每档累计时长**，没有区间上下限（bpm），也没有区间个数设置。
+  因此回答不了「Z3 是多少 bpm」，也不要把 zone_N 直接叫成 Z1-Z5 或有氧区间。
 """
 
 
@@ -268,6 +270,69 @@ def build_server(cfg: Config) -> Any:
             if not rows:
                 result["hint"] = "该区间没有记录，可先用 get_data_overview 确认数据覆盖范围"
             return result
+
+    @mcp.tool()
+    def get_hr_zones(
+        start_date: str | None = None,
+        end_date: str | None = None,
+        sport: str | None = None,
+    ) -> dict[str, Any]:
+        """统计心率区间分布：各区间时长、占比、主要落在哪一档。
+
+        数据来自活动摘要里设备已经算好的每个区间累计时长，不是重新分桶。
+
+        最重要的一点：**归档里没有区间边界（bpm），也没有区间个数的设置。**
+        因此本工具只能回答「各区间花了多少时间、占比多少」，回答不了
+        「Z3 是 152 到 166 bpm」，也不要自行把 zone_2 翻译成「Z3」或
+        「有氧区间」——编号是文件里的 `hrTimeInZone_N`，与手表上显示的分区
+        对应关系在导出包里没有定义。被问到边界时就说明归档不含这项数据。
+
+        各区间含义只能按编号顺序描述：编号越大强度越高。zone_0 是强度最低
+        的那一档（通常是热身与恢复），编号最大的一档是强度最高的。
+
+        参数：
+            start_date / end_date  YYYY-MM-DD，含端点，均可省略；
+                两者都省略时统计整个索引范围
+            sport                 只看某项运动，例如 running / cycling /
+                                  walking / hiking。省略则全部合并
+
+        结果里的 `without_zone_data` 要留意：没有区间记录的活动**不计入**占比，
+        因为把缺数据当成「各区间都是 0」会稀释每一档的占比。
+        它不为 0 时，占比只代表有记录的那部分活动。
+        """
+        start = _date(start_date, "start_date")
+        end = _date(end_date, "end_date")
+        if start and end and start > end:
+            raise ToolError("start_date 不能晚于 end_date")
+
+        with _store() as store:
+            rows = store.query_activities(start=start, end=end, sport=sport)
+            result = zone_summary(rows)
+            result["range"] = {
+                "from": start or (rows and rows[-1]["date"]) or None,
+                "to": end or (rows and rows[0]["date"]) or None,
+            }
+            if sport:
+                result["sport_filter"] = sport
+
+        if not result.get("activities"):
+            return {
+                **result,
+                "hint": "该区间没有活动记录，可先用 get_data_overview 确认数据覆盖范围",
+            }
+
+        if not result.get("total_s"):
+            result["hint"] = (
+                "这些活动都没有心率区间数据。设备未开启心率监测或归档未包含时"
+                "会出现这种情况，不要据此说「没有高强度训练」。"
+            )
+            return result
+
+        result["zones_note"] = (
+            "zone 编号即归档里的 hrTimeInZone_N，编号越大强度越高；"
+            "归档不含区间上下限（bpm），因此无法把这七档对应到手表上的 Z1-Z5"
+        )
+        return result
 
     @mcp.tool()
     def get_daily_summary(

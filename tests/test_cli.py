@@ -363,6 +363,7 @@ def test_doctor_reports_counts(tmp_path: Path, capsys) -> None:
     assert main(args + ["doctor"]) == 0
     out = capsys.readouterr().out
     assert "活动       2 条" in out
+    assert "心率区间   2/2 条活动有区间数据" in out
     assert "每日汇总   2 天" in out
     assert "睡眠       2 晚" in out
     assert "训练状态   2 天" in out

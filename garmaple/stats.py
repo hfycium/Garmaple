@@ -129,3 +129,72 @@ def summarize(rows: Iterable[Mapping[str, Any] | Any]) -> dict[str, Any]:
         out["fastest"] = fastest
 
     return {k: v for k, v in out.items() if v is not None}
+
+
+ZONE_COUNT = 7
+
+
+def zone_summary(rows: Iterable[Mapping[str, Any] | Any]) -> dict[str, Any]:
+    """把一组活动聚合成心率区间分布。
+
+    只统计**有区间数据**的活动，并单独报出没有的那部分。把缺数据的活动
+    当成「各区间都是 0」会稀释占比——那等于说「他这几次没花时间在任何区间」，
+    而事实是那几次没有区间记录。
+
+    区间编号照搬归档里的 `hrTimeInZone_N`，不做「Z1..Z5」的映射：归档里
+    既没有区间上下限（bpm），也没有区间个数的设置，套上 Z 编号等于编造
+    一个不存在的对应关系。
+    """
+    items = list(rows)
+    totals = [0] * ZONE_COUNT
+    by_sport: dict[str, list[int]] = {}
+    sport_counts: Counter[str] = Counter()
+    used = 0
+
+    for row in items:
+        zones = [_get(row, f"hr_zone_{i}") or 0 for i in range(ZONE_COUNT)]
+        if not any(zones):
+            continue
+        used += 1
+        sport = _get(row, "sport") or "unknown"
+        sport_counts[sport] += 1
+        bucket = by_sport.setdefault(sport, [0] * ZONE_COUNT)
+        for i, value in enumerate(zones):
+            totals[i] += value
+            bucket[i] += value
+
+    total = sum(totals)
+    out: dict[str, Any] = {
+        "activities": len(items),
+        "with_zone_data": used,
+        "without_zone_data": len(items) - used,
+        "total_s": total,
+        "total": human_duration(total),
+    }
+
+    if not total:
+        return out
+
+    out["zones"] = [
+        {
+            "zone": i,
+            "seconds": seconds,
+            "time": human_duration(seconds),
+            "pct": round(seconds / total * 100, 1),
+        }
+        for i, seconds in enumerate(totals)
+    ]
+    out["dominant_zone"] = totals.index(max(totals))
+
+    if len(by_sport) > 1:
+        out["by_sport"] = {
+            sport: {
+                "activities": sport_counts[sport],
+                "total_s": sum(bucket),
+                "total": human_duration(sum(bucket)),
+                "pct": [round(v / sum(bucket) * 100, 1) for v in bucket],
+            }
+            for sport, bucket in sorted(by_sport.items())
+        }
+
+    return out

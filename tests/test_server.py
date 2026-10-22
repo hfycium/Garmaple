@@ -48,7 +48,43 @@ def test_daily_summary_tool_is_registered(tmp_path: Path) -> None:
     assert "get_vo2max_trend" in names
     assert "get_personal_records" in names
     assert "get_gear_mileage" in names
-    assert len(names) == 11
+    assert "get_hr_zones" in names
+    assert len(names) == 12
+
+
+def test_hr_zones_distribution(tmp_path: Path) -> None:
+    """两条活动各 1800s/900s，合并后 3600s 与 1800s，占比 66.7 / 33.3。"""
+    out = call(prepared(tmp_path), "get_hr_zones", {})
+    assert out["activities"] == 2
+    assert out["with_zone_data"] == 2
+    assert out["without_zone_data"] == 0
+    assert out["total_s"] == 5400
+    zones = {z["zone"]: z["seconds"] for z in out["zones"]}
+    assert zones[3] == 3600 and zones[4] == 1800
+    assert out["dominant_zone"] == 3
+    pct = {z["zone"]: z["pct"] for z in out["zones"]}
+    assert pct[3] == 66.7 and pct[4] == 33.3
+
+
+def test_hr_zones_says_boundaries_are_missing(tmp_path: Path) -> None:
+    """必须随结果说明「没有 bpm 边界」。
+
+    归档里没有区间定义，模型看到 zone_2 很容易自行说成「Z3 / 有氧区间」，
+    那不是数据里的东西。
+    """
+    out = call(prepared(tmp_path), "get_hr_zones", {})
+    assert "bpm" in out["zones_note"]
+    assert "Z1-Z5" in out["zones_note"]
+
+
+def test_hr_zones_empty_range_gives_hint(tmp_path: Path) -> None:
+    out = call(
+        prepared(tmp_path),
+        "get_hr_zones",
+        {"start_date": "2030-01-01", "end_date": "2030-01-02"},
+    )
+    assert out["activities"] == 0
+    assert "hint" in out
 
 
 def test_daily_summary_defaults_to_recent_days_in_order(tmp_path: Path) -> None:
@@ -588,6 +624,8 @@ def test_expected_failures_are_not_wrapped_as_crash(tmp_path: Path) -> None:
         ("get_vo2max_trend", {"start_date": "2026-07-22", "end_date": "2026-07-20"}),
         ("get_vo2max_trend", {"end_date": "not-a-date"}),
         ("get_personal_records", {"group": "not-a-group"}),
+        ("get_hr_zones", {"start_date": "2026-07-22", "end_date": "2026-07-20"}),
+        ("get_hr_zones", {"start_date": "2026/07/20"}),
     ]
     for name, args in cases:
         with pytest.raises(ToolError) as excinfo:

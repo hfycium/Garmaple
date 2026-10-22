@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from garmaple.stats import human_duration, human_pace, summarize
+from garmaple.stats import human_duration, human_pace, summarize, zone_summary
 
 
 def row(**overrides: object) -> dict[str, object]:
@@ -129,3 +129,72 @@ def test_none_values_are_not_emitted() -> None:
     # 缺失字段直接不输出，避免返回值被 null 撑大
     assert "total_moving" not in out
     assert out["total_elevation_m"] == 0
+
+
+# ---------- 心率区间 ----------
+
+
+def zone_row(zones: list[int], **overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {f"hr_zone_{i}": v for i, v in enumerate(zones)}
+    base.update(overrides)
+    return base
+
+
+def test_zone_summary_counts_time_and_percent() -> None:
+    out = zone_summary(
+        [
+            zone_row([0, 0, 600, 1800, 600, 0, 0]),
+            zone_row([0, 0, 0, 1200, 300, 0, 0]),
+        ]
+    )
+    assert out["activities"] == 2
+    assert out["with_zone_data"] == 2
+    assert out["total_s"] == 4500
+    assert [z["seconds"] for z in out["zones"]] == [0, 0, 600, 3000, 900, 0, 0]
+    assert out["zones"][3]["pct"] == 66.7
+    assert out["dominant_zone"] == 3
+
+
+def test_zone_summary_skips_activities_without_data() -> None:
+    """没有区间数据的活动不能被当成「各档都是 0」。
+
+    当成 0 会把每一档的占比一起稀释，等于说「他那几次没在任何区间待过」。
+    """
+    out = zone_summary([zone_row([0, 0, 0, 1000, 0, 0, 0]), zone_row([0] * 7)])
+    assert out["with_zone_data"] == 1
+    assert out["without_zone_data"] == 1
+    assert out["total_s"] == 1000
+    assert out["zones"][3]["pct"] == 100.0
+
+
+def test_zone_summary_without_any_data_has_no_zones() -> None:
+    """一条区间数据都没有时，不给 zones 数组——全 0 的分布会被读成「没有强度」。"""
+    out = zone_summary([zone_row([0] * 7)])
+    assert out["total_s"] == 0
+    assert "zones" not in out
+    assert "dominant_zone" not in out
+
+
+def test_zone_summary_splits_by_sport() -> None:
+    out = zone_summary(
+        [
+            zone_row([0, 0, 0, 1000, 0, 0, 0], sport="running"),
+            zone_row([0, 100, 0, 0, 0, 0, 0], sport="cycling"),
+        ]
+    )
+    assert set(out["by_sport"]) == {"running", "cycling"}
+    assert out["by_sport"]["running"]["pct"][3] == 100.0
+    assert out["by_sport"]["cycling"]["activities"] == 1
+
+
+def test_zone_summary_single_sport_has_no_breakdown() -> None:
+    """只有一种运动时再给一份同样的分布只是重复。"""
+    out = zone_summary([zone_row([0, 0, 0, 1000, 0, 0, 0], sport="running")])
+    assert "by_sport" not in out
+
+
+def test_zone_summary_tolerates_missing_columns() -> None:
+    out = zone_summary([{"sport": "running"}])
+    assert out["activities"] == 1
+    assert out["with_zone_data"] == 0
+    assert out["total_s"] == 0

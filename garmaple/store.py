@@ -802,6 +802,16 @@ class Store:
     def count_activities(self) -> int:
         return self._conn.execute("SELECT COUNT(*) AS n FROM activities").fetchone()["n"]
 
+    def count_activities_with_zones(self) -> int:
+        """有任意一个心率区间时长的活动数。
+
+        用于回答「区间分析覆盖了多少次训练」——分母是它，不是活动总数。
+        """
+        cols = " + ".join(f"COALESCE(hr_zone_{i}, 0)" for i in range(7))
+        return self._conn.execute(
+            f"SELECT COUNT(*) AS n FROM activities WHERE {cols} > 0"
+        ).fetchone()["n"]
+
     def count_days(self) -> int:
         return self._conn.execute("SELECT COUNT(*) AS n FROM days").fetchone()["n"]
 
