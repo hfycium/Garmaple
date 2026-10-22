@@ -16,6 +16,7 @@ import pytest
 from garmaple.cli import main
 from garmaple.config import Config
 from garmaple.server import build_server
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 
 from .test_cli import build_archive
 
@@ -85,17 +86,19 @@ def test_daily_summary_empty_range_gives_hint(tmp_path: Path) -> None:
 
 
 def test_daily_summary_rejects_reversed_range(tmp_path: Path) -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(ToolError) as excinfo:
         call(
             prepared(tmp_path),
             "get_daily_summary",
             {"start_date": "2026-07-22", "end_date": "2026-07-20"},
         )
+    assert "不能晚于" in str(excinfo.value)
 
 
 def test_daily_summary_rejects_bad_date_format(tmp_path: Path) -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(ToolError) as excinfo:
         call(prepared(tmp_path), "get_daily_summary", {"start_date": "2026/07/20"})
+    assert "YYYY-MM-DD" in str(excinfo.value)
 
 
 def test_daily_summary_is_privacy_filtered(tmp_path: Path) -> None:
@@ -129,3 +132,83 @@ def test_overview_omits_daily_block_when_absent(tmp_path: Path) -> None:
     assert "daily_summary" not in out
     # 活动工具照常可用
     assert out["activities"] == 2
+
+
+# ---------- 预期内失败：必须让模型看见原因 ----------
+#
+# 为什么这几条要单独测：SDK 只把 ToolError 的文本透给模型；其他异常被当成
+# crash，模型只看到 `Error executing tool <name>`，原因只留在服务端日志里。
+# 注意 UnexpectedToolError 是 ToolError 的子类，光断言 ToolError 抓不住退化。
+
+
+def test_expected_failures_are_not_wrapped_as_crash(tmp_path: Path) -> None:
+    cfg = prepared(tmp_path)
+    cases = [
+        ("get_daily_summary", {"start_date": "2026-07-22", "end_date": "2026-07-20"}),
+        ("get_daily_summary", {"start_date": "2026/07/20"}),
+        ("list_activities", {"start_date": "13-01-2026"}),
+        ("get_period_summary", {"start_date": "2026-07-22", "end_date": "2026-07-20"}),
+        ("get_period_summary", {"start_date": "2026-07-22", "end_date": "2026-07-20"}),
+    ]
+    for name, args in cases:
+        with pytest.raises(ToolError) as excinfo:
+            call(cfg, name, args)
+        assert not isinstance(excinfo.value, UnexpectedToolError), (
+            f"{name} 的参数错误退化成了 crash，原因会被吞掉"
+        )
+
+
+def test_reason_reaches_the_model_over_stdio(tmp_path: Path) -> None:
+    """端到端：真实 stdio 子进程 + 官方 client，看客户端最终拿到什么。
+
+    单测里 call_tool 是内存调用，抛的是异常对象；真实客户端收到的是
+    CallToolResult，两者形状不同。这条走完整链路，锁住用户实际看到的内容。
+    """
+    import os
+    import sys
+
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    cfg = prepared(tmp_path)
+    root = Path(__file__).resolve().parents[1]
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(root),
+        "GARMAPLE_DATA": str(cfg.data_dir),
+        "GARMAPLE_CACHE": str(cfg.cache_dir),
+        "GARMAPLE_PRIVACY": "strict",
+    }
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "garmaple.cli", "serve"],
+        env=env,
+    )
+
+    async def ask() -> object:
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                return await session.call_tool(
+                    "get_daily_summary",
+                    {"start_date": "2026-07-22", "end_date": "2026-07-20"},
+                )
+
+    result = asyncio.run(ask())
+    assert result.is_error is True
+    text = result.content[0].text
+    # 关键断言：原因必须到达客户端，而不只是 `Error executing tool ...`
+    assert "不能晚于" in text
+
+
+def test_missing_index_says_how_to_fix(tmp_path: Path) -> None:
+    """没建索引是预期内的情况，应当告诉模型去跑 index，而不是只报崩溃。"""
+    cfg = Config(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        privacy="strict",
+    )
+    with pytest.raises(ToolError) as excinfo:
+        call(cfg, "get_data_overview")
+    assert not isinstance(excinfo.value, UnexpectedToolError)
+    assert "garmaple index" in str(excinfo.value)
