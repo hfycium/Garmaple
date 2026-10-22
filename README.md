@@ -76,12 +76,12 @@ Garmaple 不是实时工具，数据新鲜度取决于你上次导出的时间�
 - [ ] `get_recovery_correlation` — 睡眠 / 压力 / 身体电量与训练表现的相关性
 - [x] `get_gear_mileage` — 跑鞋装备里程预警
 
-> `get_training_load` 为什么空着：CTL / ATL / TSB 是拿**单次训练负荷**（`training_stress_score`）逐日累加算出来的，缺了输入就复现不出佳明那套口径。这里要分清两件事：
+> `get_training_load` 为什么空着：代码已经实现（42 天 / 7 天 EMA，CTL / ATL / TSB），但**本机数据验不了**。CTL / ATL / TSB 的输入是 FIT `session` 消息的 `training_stress_score`（TSS，字段号 35），逐日累加后做指数平滑。这里要分清两件事：
 >
-> - **格式支持，不是拿不到。** `training_stress_score`、`intensity_factor`、`normalized_power` 都是 FIT `session` 消息的标准字段（156 个里明确在列），戴功率计或新设备的用户写满了就有。
+> - **格式支持，不是拿不到。** `training_stress_score`、`intensity_factor`、`normalized_power` 都是 FIT `session` 消息的标准字段，戴功率计或新设备的用户写满了就有。代码已按此实现。
 > - **是本机设备没写。** 逐个文件核过 304 个活动，这三个字段一次都没填过数。
 >
-> 所以不是「这功能做不了」，而是「这份数据验不了」。等有 TSS 输入就能按 42 天 / 7 天指数平滑算 CTL / ATL / TSB，不用拿训练效果去近似——那是另一个量纲的东西。
+> 因此真实数据下调用返回 `available: false` 并解释原因，不会给出假的 CTL 值。等有 TSS 输入的导出包就能直接用。不用拿训练效果去近似——那是另一个量纲的东西。
 >
 > 想看体能走向时，用 `get_training_status` 里的 `fitness_trend`（体能水平趋势）与 `load_position`（周负荷落在最优负荷区间的哪一侧）；或者直接看 `get_race_predictions` 的预测时间——那是设备按当前体能推算的能力值，比用训练效果拼出来的曲线可信。
 
