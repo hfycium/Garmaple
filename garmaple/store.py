@@ -18,9 +18,10 @@ from typing import Iterable
 
 from .parser.activities import Activity
 from .parser.daily import DailyStat
+from .parser.sleep import STATUS_OK, SleepRecord
 from .privacy import pseudo_activity_id
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _META_SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -108,6 +109,7 @@ CREATE TABLE IF NOT EXISTS days (
     bb_end               INTEGER,
     bb_high_at           TEXT,
     bb_low_at            TEXT,
+    utc_offset_hours     REAL,
     user_profile_id      INTEGER,
     source               TEXT
 );
@@ -121,7 +123,38 @@ _DAY_COLUMNS = (
     "stress_avg", "stress_max", "stress_off_wrist_min",
     "stress_rest_s", "stress_low_s", "stress_medium_s", "stress_high_s",
     "bb_charged", "bb_drained", "bb_high", "bb_low", "bb_start", "bb_end",
-    "bb_high_at", "bb_low_at", "user_profile_id", "source",
+    "bb_high_at", "bb_low_at", "utc_offset_hours", "user_profile_id", "source",
+)
+
+# 睡眠。主键同样是日历日，但口径是**本地醒来日**：一晚的睡眠记在醒来那天。
+# 与 days 表可以按 date 直接对照（实测两边都是 608 天、日期完全重合）。
+# asleep_min 不入库——它是「窗口 − 清醒 − 测不到」推出来的，存一份等于留两份真相；
+# 睡眠数据只有几百条，读取时算一次不影响性能。
+_SLEEPS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS sleeps (
+    date            TEXT PRIMARY KEY,
+    start_at        TEXT,
+    end_at          TEXT,
+    in_bed_min      INTEGER,
+    deep_min        INTEGER,
+    light_min       INTEGER,
+    rem_min         INTEGER,
+    awake_min       INTEGER,
+    unmeasured_min  INTEGER,
+    respiration_avg REAL,
+    respiration_low REAL,
+    respiration_high REAL,
+    status          TEXT NOT NULL,
+    retro           INTEGER,
+    source          TEXT
+);
+"""
+
+_SLEEP_COLUMNS = (
+    "date", "start_at", "end_at", "in_bed_min",
+    "deep_min", "light_min", "rem_min", "awake_min", "unmeasured_min",
+    "respiration_avg", "respiration_low", "respiration_high",
+    "status", "retro", "source",
 )
 
 _COLUMNS = (
@@ -217,7 +250,17 @@ def _day_tuple(day: DailyStat, source: str) -> tuple[object, ...]:
         day.bb_charged, day.bb_drained, day.bb_high, day.bb_low,
         day.bb_start, day.bb_end,
         _iso(day.bb_high_at), _iso(day.bb_low_at),
+        day.utc_offset_hours,
         day.user_profile_id, source,
+    )
+
+
+def _sleep_tuple(rec: SleepRecord, source: str) -> tuple[object, ...]:
+    return (
+        rec.date, _iso(rec.start_at), _iso(rec.end_at), rec.in_bed_min,
+        rec.deep_min, rec.light_min, rec.rem_min, rec.awake_min, rec.unmeasured_min,
+        rec.respiration_avg, rec.respiration_low, rec.respiration_high,
+        rec.status, 1 if rec.retro else 0, source,
     )
 
 
@@ -252,8 +295,40 @@ def row_to_daily(row: sqlite3.Row) -> DailyStat:
         bb_end=row["bb_end"],
         bb_high_at=_parse_dt(row["bb_high_at"]),
         bb_low_at=_parse_dt(row["bb_low_at"]),
+        utc_offset_hours=row["utc_offset_hours"],
         user_profile_id=row["user_profile_id"],
     )
+
+
+def row_to_sleep(row: sqlite3.Row) -> SleepRecord:
+    """把 sleeps 表的行还原成 SleepRecord。
+
+    `asleep_min` 不在表里，由 SleepRecord 自己从窗口与清醒时长推出来——
+    所以这里必须把分段值原样带上，不能省。
+    """
+    rec = SleepRecord(
+        date=row["date"],
+        start_at=_parse_dt(row["start_at"]),
+        end_at=_parse_dt(row["end_at"]),
+        in_bed_min=row["in_bed_min"],
+        deep_min=row["deep_min"],
+        light_min=row["light_min"],
+        rem_min=row["rem_min"],
+        awake_min=row["awake_min"],
+        unmeasured_min=row["unmeasured_min"],
+        respiration_avg=row["respiration_avg"],
+        respiration_low=row["respiration_low"],
+        respiration_high=row["respiration_high"],
+        status=row["status"],
+        retro=bool(row["retro"]),
+    )
+    # 睡着时长走的是秒级口径，入库时没存；用分钟级字段重建即可，
+    # 误差不超过各字段取整的累积（实测 ≤1 分钟），不影响展示
+    if rec.status == STATUS_OK and rec.in_bed_min is not None:
+        rec._asleep_seconds = int(
+            round((rec.in_bed_min - (rec.awake_min or 0) - (rec.unmeasured_min or 0)) * 60)
+        )
+    return rec
 
 
 class Store:
@@ -266,12 +341,14 @@ class Store:
         self._migrate()
         self._conn.executescript(_SCHEMA)
         self._conn.executescript(_DAYS_SCHEMA)
+        self._conn.executescript(_SLEEPS_SCHEMA)
         self._conn.commit()
 
     # 结构自愈的判据：每张表缺了这些列就视为旧表
     _REQUIRED_COLUMNS = {
         "activities": frozenset({"pseudo_id", "sport", "date", "distance_m"}),
-        "days": frozenset({"date", "steps", "resting_hr", "stress_avg"}),
+        "days": frozenset({"date", "steps", "resting_hr", "stress_avg", "utc_offset_hours"}),
+        "sleeps": frozenset({"date", "in_bed_min", "status", "deep_min"}),
     }
 
     def _migrate(self) -> None:
@@ -334,6 +411,21 @@ class Store:
             self._conn.executemany(sql, rows)
         return len(rows)
 
+    def upsert_sleeps(self, records: Iterable[SleepRecord], source: str) -> int:
+        """幂等写入睡眠记录，返回写入的行数。"""
+        placeholders = ", ".join("?" * len(_SLEEP_COLUMNS))
+        sql = (
+            f"INSERT INTO sleeps ({', '.join(_SLEEP_COLUMNS)}) VALUES ({placeholders}) "
+            "ON CONFLICT(date) DO UPDATE SET "
+            + ", ".join(f"{c}=excluded.{c}" for c in _SLEEP_COLUMNS if c != "date")
+        )
+        rows = [_sleep_tuple(r, source) for r in records]
+        if not rows:
+            return 0
+        with self._conn:
+            self._conn.executemany(sql, rows)
+        return len(rows)
+
     def set_meta(self, key: str, value: str) -> None:
         with self._conn:
             self._conn.execute(
@@ -354,16 +446,21 @@ class Store:
     def count_days(self) -> int:
         return self._conn.execute("SELECT COUNT(*) AS n FROM days").fetchone()["n"]
 
-    def query_days(
+    def count_sleeps(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) AS n FROM sleeps").fetchone()["n"]
+
+    def _query_by_date(
         self,
+        table: str,
         start: str | date | None = None,
         end: str | date | None = None,
         limit: int | None = None,
         order: str = "asc",
     ) -> list[sqlite3.Row]:
-        """按日期区间（含端点）取每日汇总。
+        """按日期区间（含端点）取行，表必须是「date 为主键」的两张之一。
 
-        默认升序：日汇总的主要用途是看趋势，时间正序才读得出来。
+        `order="desc"` 配合 limit 时先取最近 N 行再翻回正序，
+        语义才是「最近 N 天」按时间正序排列。
         """
         clauses: list[str] = []
         params: list[object] = []
@@ -375,22 +472,48 @@ class Store:
             params.append(str(end))
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        direction = "DESC" if order.lower() == "desc" else "ASC"
-        sql = f"SELECT * FROM days {where} ORDER BY date {direction}"
-        if order.lower() == "desc" and limit:
-            # 先取最近 N 天，再翻回正序，语义才是「最近 N 天的趋势」
-            sql += " LIMIT ?"
-            params.append(int(limit))
-            rows = self._conn.execute(sql, params).fetchall()
-            return list(reversed(rows))
+        descending = order.lower() == "desc"
+        sql = f"SELECT * FROM {table} {where} ORDER BY date {'DESC' if descending else 'ASC'}"
         if limit:
             sql += " LIMIT ?"
             params.append(int(limit))
-        return self._conn.execute(sql, params).fetchall()
+        rows = self._conn.execute(sql, params).fetchall()
+        # 只有「降序 + 限条数」才翻回正序：此时取的是「最近 N 天」，
+        # 调用方要的是这 N 天按时间排列。单纯 desc 仍返回降序。
+        return list(reversed(rows)) if descending and limit else rows
+
+    def query_days(
+        self,
+        start: str | date | None = None,
+        end: str | date | None = None,
+        limit: int | None = None,
+        order: str = "asc",
+    ) -> list[sqlite3.Row]:
+        """按日期区间（含端点）取每日汇总。
+
+        默认升序：日汇总的主要用途是看趋势，时间正序才读得出来。
+        """
+        return self._query_by_date("days", start, end, limit, order)
+
+    def query_sleeps(
+        self,
+        start: str | date | None = None,
+        end: str | date | None = None,
+        limit: int | None = None,
+        order: str = "asc",
+    ) -> list[sqlite3.Row]:
+        """按日期区间取睡眠记录。日期口径是本地**醒来日**。"""
+        return self._query_by_date("sleeps", start, end, limit, order)
 
     def day_range(self) -> tuple[str | None, str | None]:
         row = self._conn.execute(
             "SELECT MIN(date) AS lo, MAX(date) AS hi FROM days"
+        ).fetchone()
+        return (row["lo"], row["hi"])
+
+    def sleep_range(self) -> tuple[str | None, str | None]:
+        row = self._conn.execute(
+            "SELECT MIN(date) AS lo, MAX(date) AS hi FROM sleeps"
         ).fetchone()
         return (row["lo"], row["hi"]) if row else (None, None)
 

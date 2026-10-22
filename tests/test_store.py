@@ -306,3 +306,154 @@ def test_broken_days_table_self_heals(tmp_path: Path) -> None:
         assert "stress_avg" in cols
         assert s.count_days() == 0  # 旧表被丢弃，等下次 index 重灌
         assert s.upsert_days([day("2026-07-24")], source="x") == 1
+
+
+# ---------------- sleeps 表 ----------------
+
+def sleep(calendar_date: str, **overrides: object):
+    from garmaple.parser.sleep import parse_sleep
+
+    from .test_sleep import make_sleep
+
+    rec = parse_sleep(make_sleep(calendarDate=calendar_date, **overrides), offset_hours=8.0)
+    assert rec is not None
+    return rec
+
+
+def test_sleeps_upsert_and_count(tmp_path: Path) -> None:
+    with Store(tmp_path / "s.sqlite3") as s:
+        assert s.upsert_sleeps([sleep("2026-07-24"), sleep("2026-07-25")], source="x") == 2
+        assert s.count_sleeps() == 2
+
+
+def test_sleeps_upsert_is_idempotent(tmp_path: Path) -> None:
+    with Store(tmp_path / "s.sqlite3") as s:
+        s.upsert_sleeps([sleep("2026-07-24")], source="x")
+        s.upsert_sleeps([sleep("2026-07-24", deepSleepSeconds=1800)], source="x")
+        assert s.count_sleeps() == 1
+        assert s.query_sleeps()[0]["deep_min"] == 30
+
+
+def test_sleeps_date_range_is_inclusive(tmp_path: Path) -> None:
+    with Store(tmp_path / "s.sqlite3") as s:
+        s.upsert_sleeps(
+            [sleep("2026-07-23"), sleep("2026-07-24"), sleep("2026-07-25")], source="x"
+        )
+        rows = s.query_sleeps(start="2026-07-24", end="2026-07-25")
+        assert [r["date"] for r in rows] == ["2026-07-24", "2026-07-25"]
+        assert s.query_sleeps(start="2099-01-01") == []
+
+
+def test_sleeps_limit_desc_returns_most_recent_in_order(tmp_path: Path) -> None:
+    with Store(tmp_path / "s.sqlite3") as s:
+        s.upsert_sleeps(
+            [sleep("2026-07-22"), sleep("2026-07-23"),
+             sleep("2026-07-24"), sleep("2026-07-25")], source="x"
+        )
+        assert [r["date"] for r in s.query_sleeps(limit=2, order="desc")] == [
+            "2026-07-24", "2026-07-25",
+        ]
+
+
+def test_sleeps_plain_desc_stays_descending(tmp_path: Path) -> None:
+    """不带 limit 的 desc 仍返回降序——翻回正序只在「取最近 N 天」时才成立。"""
+    with Store(tmp_path / "s.sqlite3") as s:
+        s.upsert_sleeps([sleep("2026-07-23"), sleep("2026-07-25")], source="x")
+        assert [r["date"] for r in s.query_sleeps(order="desc")] == [
+            "2026-07-25", "2026-07-23",
+        ]
+
+
+def test_sleep_range(tmp_path: Path) -> None:
+    with Store(tmp_path / "s.sqlite3") as s:
+        assert s.sleep_range() == (None, None)
+        s.upsert_sleeps([sleep("2026-07-23"), sleep("2026-07-25")], source="x")
+        assert s.sleep_range() == ("2026-07-23", "2026-07-25")
+
+
+def test_sleep_roundtrip_keeps_stages_and_times(tmp_path: Path) -> None:
+    from datetime import datetime
+
+    from garmaple.store import row_to_sleep
+
+    with Store(tmp_path / "s.sqlite3") as s:
+        s.upsert_sleeps([sleep("2026-07-24")], source="x")
+        restored = row_to_sleep(s.query_sleeps()[0])
+    assert restored.in_bed_min == 661
+    assert restored.deep_min == 90
+    assert restored.start_at == datetime(2026, 7, 23, 23, 20)
+    assert restored.end_at == datetime(2026, 7, 24, 10, 21)
+    # asleep_min 不在表里，读回来要能重算出来
+    assert restored.asleep_min == 661 - 52
+
+
+def test_sleep_roundtrip_keeps_status_without_duration(tmp_path: Path) -> None:
+    """摘表那晚读回来仍必须是「无时长」，不能在往返路上变成 0。"""
+    from garmaple.store import row_to_sleep
+
+    with Store(tmp_path / "s.sqlite3") as s:
+        s.upsert_sleeps(
+            [sleep("2026-07-24", sleepWindowConfirmationType="OFF_WRIST",
+                   deepSleepSeconds=0, lightSleepSeconds=0, remSleepSeconds=0,
+                   awakeSleepSeconds=0, unmeasurableSeconds=0)],
+            source="x",
+        )
+        restored = row_to_sleep(s.query_sleeps()[0])
+    assert restored.status == "off_wrist"
+    assert restored.asleep_min is None
+    assert restored.in_bed_min is None
+
+
+def test_three_tables_coexist(tmp_path: Path) -> None:
+    with Store(tmp_path / "s.sqlite3") as s:
+        s.upsert_activities([act(1)], source="x")
+        s.upsert_days([day("2026-07-24")], source="x")
+        s.upsert_sleeps([sleep("2026-07-24")], source="x")
+        assert (s.count_activities(), s.count_days(), s.count_sleeps()) == (1, 1, 1)
+
+
+def test_broken_sleeps_table_self_heals(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "old-sleeps.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE sleeps (date TEXT PRIMARY KEY, minutes INTEGER);
+        CREATE TABLE days (date TEXT PRIMARY KEY, steps INTEGER, resting_hr INTEGER,
+                           stress_avg INTEGER, utc_offset_hours REAL);
+        CREATE TABLE activities (activity_id INTEGER PRIMARY KEY, pseudo_id TEXT,
+                                 sport TEXT, date TEXT, distance_m REAL);
+        INSERT INTO sleeps VALUES ('2026-07-24', 480);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as s:
+        cols = {r[1] for r in s._conn.execute("PRAGMA table_info(sleeps)")}
+        assert "status" in cols
+        assert s.count_sleeps() == 0  # 旧表被丢弃，等下次 index 重灌
+        assert s.upsert_sleeps([sleep("2026-07-24")], source="x") == 1
+
+
+def test_old_days_table_without_offset_self_heals(tmp_path: Path) -> None:
+    """days 表新增了 utc_offset_hours：旧库缺这列时必须重建，否则读取会 KeyError。"""
+    import sqlite3
+
+    path = tmp_path / "old-days2.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE days (date TEXT PRIMARY KEY, steps INTEGER, resting_hr INTEGER,
+                           stress_avg INTEGER);
+        INSERT INTO days VALUES ('2026-07-24', 100, 50, 30);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as s:
+        cols = {r[1] for r in s._conn.execute("PRAGMA table_info(days)")}
+        assert "utc_offset_hours" in cols
+        assert s.count_days() == 0
