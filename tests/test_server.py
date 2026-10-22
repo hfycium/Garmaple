@@ -161,6 +161,20 @@ def test_sleep_default_limit_returns_most_recent(tmp_path: Path) -> None:
     assert out["nights"][0]["date"] == "2026-07-22"
 
 
+def test_sleep_range_is_not_cut_by_the_recent_default(tmp_path: Path) -> None:
+    """给了区间就尊重区间：默认「最近 14 晚」不能把区间查询截掉。
+
+    真实数据上是 608 晚，若默认 limit 同时管区间，问「这个月睡得怎样」
+    会静默只拿到两周，看起来像中间缺数据。
+    """
+    out = call(
+        prepared(tmp_path), "get_sleep",
+        {"start_date": "2026-07-20", "end_date": "2026-07-22"},
+    )
+    assert out["count"] == 3
+    assert "truncated" not in out
+
+
 def test_sleep_strict_withholds_bed_and_wake_times(tmp_path: Path) -> None:
     out = call(prepared(tmp_path), "get_sleep", {})
     text = json.dumps(out, ensure_ascii=False)

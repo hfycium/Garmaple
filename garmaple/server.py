@@ -238,7 +238,7 @@ def build_server(cfg: Config) -> Any:
     def get_sleep(
         start_date: str | None = None,
         end_date: str | None = None,
-        limit: int = 14,
+        limit: int | None = None,
     ) -> dict[str, Any]:
         """查看每晚睡眠：时长、分期、呼吸率。
 
@@ -246,9 +246,10 @@ def build_server(cfg: Config) -> Any:
         查昨天会拿到前一晚的数据。这一点答错整段结论都会错位。
 
         参数：
-            start_date / end_date: YYYY-MM-DD，含端点，均可省略；
-                两者都省略时返回最近 limit 晚
-            limit: 最多返回晚数，默认 14，上限 120；区间结果超长时只保留最近的部分
+            start_date / end_date: YYYY-MM-DD，含端点，均可省略
+            limit: 最多返回晚数，上限 120。
+                不给日期时默认最近 14 晚；给了日期则默认返回区间内全部
+                （超过 120 晚才截断并置 truncated）
 
         结果按日期正序。每晚的 status 说明可信度：
             ok          有完整分期
@@ -260,11 +261,15 @@ def build_server(cfg: Config) -> Any:
         摘下到戴上的间隔、或固定占位值，当成睡眠时长会被读成睡了十几小时。
         官方导出包里没有睡眠评分数值，被问到时直接说明没有，不要估算。
         """
-        capped = max(1, min(int(limit or 14), 120))
         start = _date(start_date, "start_date")
         end = _date(end_date, "end_date")
         if start and end and start > end:
             raise ToolError("start_date 不能晚于 end_date")
+
+        # 没给日期时默认看最近两周；给了日期就尊重区间，只在超过上限时截断——
+        # 否则「查这个月的睡眠」会静默只拿到两周，用户还以为中间缺数据
+        default_limit = 14 if (start is None and end is None) else 120
+        capped = max(1, min(int(limit or default_limit), 120))
 
         with _store() as store:
             if start is None and end is None:
