@@ -357,3 +357,82 @@ def test_training_keeps_zero_load() -> None:
     out = Privacy("strict").training(make_training_record(weeklyTrainingLoadSum=0))
     assert out["weekly_load"] == 0
     assert out["load_position"] == "below"
+
+
+# ---------------- 比赛预测 ----------------
+
+def make_prediction_record(**overrides: object):
+    from garmaple.parser.metrics import parse_race_prediction
+
+    from .test_metrics import make_prediction
+
+    rec = parse_race_prediction(make_prediction(**overrides))
+    assert rec is not None
+    return rec
+
+
+@pytest.mark.parametrize("level", ["strict", "normal", "raw"])
+def test_prediction_keeps_four_distances_at_every_level(level: str) -> None:
+    out = Privacy(level).prediction(make_prediction_record())
+    assert out["date"] == "2025-12-04"
+    assert set(out["predicted"]) == {"5k", "10k", "half", "marathon"}
+
+
+def test_prediction_gives_seconds_readable_time_and_pace() -> None:
+    out = Privacy("strict").prediction(make_prediction_record())
+    five = out["predicted"]["5k"]
+    assert five["seconds"] == 1065
+    assert five["time"] == "17m45s"
+    assert five["pace"] == "3'33\"/km"
+
+
+def test_prediction_marathon_pace_uses_standard_distance() -> None:
+    out = Privacy("strict").prediction(make_prediction_record())
+    # 14040 / 42.195 = 332.7s → 5'33"/km；若按 42km 会算成 5'34"
+    assert out["predicted"]["marathon"]["pace"] == "5'33\"/km"
+
+
+def test_prediction_omits_missing_distance() -> None:
+    """缺一个距离就少一个键，不能给 null 或 0。"""
+    out = Privacy("strict").prediction(make_prediction_record(raceTimeHalf=None))
+    assert "half" not in out["predicted"]
+    assert out["predicted"]["marathon"]["seconds"] == 14040
+
+
+def test_prediction_user_profile_only_in_raw() -> None:
+    assert "user_profile_id" not in Privacy("strict").prediction(make_prediction_record())
+    assert "user_profile_id" not in Privacy("normal").prediction(make_prediction_record())
+    assert Privacy("raw").prediction(make_prediction_record())["user_profile_id"] == 999
+
+
+# ---------------- 最大摄氧量 ----------------
+
+def make_vo2max_record(**overrides: object):
+    from garmaple.parser.metrics import parse_vo2max
+
+    from .test_metrics import make_vo2max
+
+    rec = parse_vo2max(make_vo2max(**overrides))
+    assert rec is not None
+    return rec
+
+
+@pytest.mark.parametrize("level", ["strict", "normal", "raw"])
+def test_vo2max_keeps_value_at_every_level(level: str) -> None:
+    out = Privacy(level).vo2max(make_vo2max_record())
+    assert out["date"] == "2025-11-25"
+    assert out["vo2max"] == 62.0
+    assert out["sport"] == "RUNNING"
+
+
+def test_vo2max_has_no_fitness_age_leak() -> None:
+    """归档里 fitnessAge 恒为占位值 "20"，任何档位都不该出现。"""
+    for level in ("strict", "normal", "raw"):
+        out = Privacy(level).vo2max(make_vo2max_record())
+        assert "fitness_age" not in out
+        assert "20" not in {str(v) for v in out.values()}
+
+
+def test_vo2max_user_profile_only_in_raw() -> None:
+    assert "user_profile_id" not in Privacy("strict").vo2max(make_vo2max_record())
+    assert Privacy("raw").vo2max(make_vo2max_record())["user_profile_id"] == 999

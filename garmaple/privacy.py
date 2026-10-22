@@ -19,8 +19,10 @@ from datetime import datetime
 
 from .parser.activities import Activity
 from .parser.daily import DailyStat
+from .parser.metrics import RACE_DISTANCES_KM, RacePrediction, Vo2maxSample
 from .parser.sleep import SleepRecord
 from .parser.training import TrainingDay
+from .stats import human_duration, human_pace
 
 # 固定盐值：让伪 ID 在多次会话间保持稳定，又不直接暴露 activityId
 _ID_SALT = "garmaple-v1"
@@ -289,6 +291,51 @@ class Privacy:
         # 隧道边界缺失时整块不给，而不是给一个 {min: null, max: null}
         if rec.tunnel_min is not None and rec.tunnel_max is not None:
             out["load_tunnel"] = {"min": rec.tunnel_min, "max": rec.tunnel_max}
+
+        if self.allows_identity:
+            out["user_profile_id"] = rec.user_profile_id
+
+        return self._strip_none(out)
+
+    def prediction(self, rec: RacePrediction) -> dict[str, object]:
+        """单日比赛成绩预测。
+
+        每个距离给三样东西：秒数（便于做差）、可读时间、预测配速。
+        秒数与可读时间是同一事实的两种写法，不算冗余——模型算差值要秒数，
+        转述给用户要可读时间，两边都现算容易算错。
+
+        配速由「时间 ÷ 标准距离」推出来，不是库里存的：全马按 42.195km，
+        用 42km 会把配速算快 0.46%。
+        """
+        predicted: dict[str, object] = {}
+        for key in RACE_DISTANCES_KM:
+            seconds = rec.times.get(key)
+            if seconds is None:
+                continue
+            predicted[key] = {
+                "seconds": seconds,
+                "time": human_duration(seconds),
+                "pace": human_pace(rec.pace_s_per_km(key)),
+            }
+
+        out: dict[str, object] = {"date": rec.date, "predicted": predicted}
+
+        if self.allows_identity:
+            out["user_profile_id"] = rec.user_profile_id
+
+        return self._strip_none(out)
+
+    def vo2max(self, rec: Vo2maxSample) -> dict[str, object]:
+        """单次最大摄氧量。
+
+        只给数值与来源项目。`fitnessAge` 不在解析层，也不在这里补——
+        归档里它恒为占位值 "20"，输出出来就会被当成真实体能年龄。
+        """
+        out: dict[str, object] = {
+            "date": rec.date,
+            "vo2max": round(rec.vo2max, 1),
+            "sport": rec.sport,
+        }
 
         if self.allows_identity:
             out["user_profile_id"] = rec.user_profile_id
