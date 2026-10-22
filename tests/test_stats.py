@@ -296,3 +296,67 @@ def test_drift_flags_short_activities_as_unreliable():
     out = pace_hr_drift(samples)
     assert out["available"] is True
     assert out["reliable"] is False
+
+
+# ---------------- CTL / ATL / TSB ----------------
+
+
+def test_training_load_series_empty():
+    from garmaple.stats import training_load_series
+
+    assert training_load_series([]) == []
+
+
+def test_training_load_series_fills_date_gaps():
+    """日期缺口补 0（休息日），不是丢掉那些天。"""
+    from garmaple.stats import training_load_series
+
+    out = training_load_series([("2026-01-01", 100.0), ("2026-01-03", 50.0)])
+    assert len(out) == 3
+    assert out[0]["date"] == "2026-01-01"
+    assert out[1]["date"] == "2026-01-02"
+    assert out[1]["tss"] == 0.0
+    assert out[2]["date"] == "2026-01-03"
+
+
+def test_training_load_series_ctl_ema():
+    """首日 TSS=42 → CTL = 42/42 = 1.0，ATL = 42/7 = 6.0。"""
+    from garmaple.stats import training_load_series
+
+    out = training_load_series([("2026-01-01", 42.0)])
+    assert out[0]["ctl"] == pytest.approx(1.0)
+    assert out[0]["atl"] == pytest.approx(6.0)
+    assert out[0]["tsb"] == pytest.approx(-5.0)
+
+
+def test_training_load_series_tsb_is_ctl_minus_atl():
+    from garmaple.stats import training_load_series
+
+    out = training_load_series([("2026-01-01", 50.0), ("2026-01-02", 0.0)])
+    for day in out:
+        # ctl/atl 各自 round 到 1 位小数，与 tsb（先减再 round）可能差 ±0.1
+        assert day["tsb"] == pytest.approx(day["ctl"] - day["atl"], abs=0.15)
+
+
+def test_training_load_series_rest_day_decays():
+    """休息日 TSS=0，CTL/ATL 逐步衰减。"""
+    from garmaple.stats import training_load_series
+
+    out = training_load_series([("2026-01-01", 100.0), ("2026-01-02", 0.0)])
+    assert out[1]["ctl"] < out[0]["ctl"]
+    assert out[1]["atl"] < out[0]["atl"]
+
+
+def test_training_load_series_over_42_days_converges():
+    """连续恒定 TSS 后 CTL 逐步逼近 TSS，但 42 天只走到 1−e⁻¹ ≈ 63%。
+
+    EMA 收敛公式：ctl(n) = TSS × (1 − (1−1/42)ⁿ)。
+    42 天后 (41/42)^42 ≈ e⁻¹ ≈ 0.368，CTL ≈ TSS × 0.632。
+    约 3 个时间常数（126 天）才进 5% 以内。
+    """
+    from garmaple.stats import training_load_series
+
+    data = [(f"2026-01-{d:02d}" if d <= 31 else f"2026-02-{d-31:02d}", 50.0) for d in range(1, 43)]
+    out = training_load_series(data)
+    assert len(out) == 42
+    assert out[-1]["ctl"] == pytest.approx(31.6, abs=1.0)

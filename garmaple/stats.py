@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import date, timedelta
 from typing import Any, Iterable, Mapping
 
 
@@ -291,5 +292,59 @@ def zone_summary(rows: Iterable[Mapping[str, Any] | Any]) -> dict[str, Any]:
             }
             for sport, bucket in sorted(by_sport.items())
         }
+
+    return out
+
+
+# CTL / ATL 的指数平滑时间常数（天）。Andy Coggan 经典口径：
+# CTL 42 天（约 6 周，衡量「体能」）、ATL 7 天（约 1 周，衡量「疲劳」）。
+CTL_DAYS = 42
+ATL_DAYS = 7
+
+
+def training_load_series(
+    daily_tss: Iterable[tuple[str, float]],
+) -> list[dict[str, Any]]:
+    """把每日 TSS 序列展开成 CTL / ATL / TSB 趋势。
+
+    口径：
+
+    - 输入是**按日期升序**的 (date, tss) 对，日期缺口自动补 0（休息日
+      TSS 为零，不是「缺失」）。日期是本地日。
+    - CTL(d) = CTL(d-1) + (TSS(d) − CTL(d-1)) / 42，ATL 同理但用 7。
+      初始值为 0——冷启动时 CTL/ATL 偏低，覆盖到 42 天后就稳了。
+    - TSB = CTL − ATL。正数表示恢复充分（体能 > 疲劳），负数表示欠恢复。
+    - **不拿训练效果（TE）近似 TSS。** 量纲不同（TE 是 0–5 级），
+      拼出来的「CTL」和佳明的不是一回事。
+
+    返回每天一个 dict：date / tss / ctl / atl / tsb，ctl/atl/tsb 保留 1 位小数。
+    """
+    items = sorted(daily_tss, key=lambda x: x[0])
+    if not items:
+        return []
+
+    first = date.fromisoformat(items[0][0])
+    last = date.fromisoformat(items[-1][0])
+    tss_map = {d: t for d, t in items}
+
+    ctl = 0.0
+    atl = 0.0
+    out: list[dict[str, Any]] = []
+    cur = first
+    while cur <= last:
+        key = cur.isoformat()
+        tss = tss_map.get(key, 0.0)
+        ctl = ctl + (tss - ctl) / CTL_DAYS
+        atl = atl + (tss - atl) / ATL_DAYS
+        out.append(
+            {
+                "date": key,
+                "tss": round(tss, 1),
+                "ctl": round(ctl, 1),
+                "atl": round(atl, 1),
+                "tsb": round(ctl - atl, 1),
+            }
+        )
+        cur += timedelta(days=1)
 
     return out
