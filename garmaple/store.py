@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -93,6 +93,53 @@ def _iso(dt) -> str | None:
     return dt.isoformat() if dt is not None else None
 
 
+def _parse_dt(value: str | None):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def row_to_activity(row: sqlite3.Row) -> Activity:
+    """把索引里的行还原成 Activity，交给 privacy 层统一格式化。
+
+    多绕一步而不是直接拼 dict，是为了让脱敏规则只有一处实现。
+    """
+    return Activity(
+        activity_id=row["activity_id"],
+        sport=row["sport"],
+        name=row["name"],
+        utc_start=_parse_dt(row["utc_start"]),
+        local_start=_parse_dt(row["local_start"]),
+        distance_m=row["distance_m"],
+        duration_s=row["duration_s"],
+        moving_s=row["moving_s"],
+        elapsed_s=row["elapsed_s"],
+        avg_hr=row["avg_hr"],
+        max_hr=row["max_hr"],
+        calories=row["calories"],
+        elevation_gain_m=row["elevation_gain_m"],
+        elevation_loss_m=row["elevation_loss_m"],
+        aerobic_te=row["aerobic_te"],
+        anaerobic_te=row["anaerobic_te"],
+        vo2max=row["vo2max"],
+        avg_speed_mps=row["avg_speed_mps"],
+        stride_length_cm=row["stride_length_cm"],
+        cadence_spm=row["cadence_spm"],
+        lap_count=row["lap_count"],
+        hr_zone_seconds=[row[f"hr_zone_{i}"] or 0 for i in range(7)],
+        location_name=row["location_name"],
+        start_lat=row["start_lat"],
+        start_lon=row["start_lon"],
+        end_lat=row["end_lat"],
+        end_lon=row["end_lon"],
+        device_id=row["device_id"],
+        user_profile_id=row["user_profile_id"],
+    )
+
+
 def _row_tuple(act: Activity, source: str) -> tuple[object, ...]:
     local_date = act.local_start.date().isoformat() if act.local_start else None
     zones = (act.hr_zone_seconds + [None] * 7)[:7]
@@ -121,13 +168,24 @@ class Store:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
+    # 结构自愈的判据：这些列缺失即视为旧表
+    _REQUIRED_COLUMNS = frozenset({"pseudo_id", "sport", "date", "distance_m"})
+
     def _migrate(self) -> None:
-        """索引随时可从 data/ 重建，因此版本不匹配时直接丢弃旧表，不做增量迁移。"""
-        row = self._conn.execute(
-            "SELECT value FROM meta WHERE key='schema_version'"
+        """索引随时可从 data/ 重建，因此结构不符时直接丢弃旧表，不做增量迁移。
+
+        判据故意用「实际列结构」而不是 meta 里的版本号：版本号可能被中途写入，
+        一旦元数据写着新版本而表仍是旧的，只查版本号就永远修不好
+        （曾因此出现 `no such column: pseudo_id`）。
+        """
+        exists = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='activities'"
         ).fetchone()
-        if row and row["value"] != str(SCHEMA_VERSION):
-            self._conn.executescript("DROP TABLE IF EXISTS activities;")
+        if exists is not None:
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(activities)")}
+            if not self._REQUIRED_COLUMNS.issubset(cols):
+                self._conn.executescript("DROP TABLE IF EXISTS activities;")
+        self._conn.commit()
         self.set_meta("schema_version", str(SCHEMA_VERSION))
 
     def close(self) -> None:

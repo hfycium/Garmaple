@@ -150,13 +150,44 @@ def test_schema_version_recorded(store: Store) -> None:
 
 
 def test_reopening_old_schema_rebuilds(tmp_path: Path) -> None:
-    """schema 版本不一致时应丢弃旧表而不是报错。"""
+    """结构完整时，仅有版本号不一致不应丢弃已索引的数据。"""
+    from garmaple.store import SCHEMA_VERSION
+
     path = tmp_path / "old.sqlite3"
     s = Store(path)
     s.upsert_activities([act(1)], source="x")
     s.set_meta("schema_version", "1")
     s.close()
 
-    s2 = Store(path)  # 触发迁移
-    assert s2.count_activities() == 0
+    s2 = Store(path)  # 触发版本检查
+    assert s2.count_activities() == 1  # 结构没问题，数据保留
+    assert s2.get_meta("schema_version") == str(SCHEMA_VERSION)  # 版本号被推进
     s2.close()
+
+
+def test_broken_table_self_heals_even_if_version_looks_new(tmp_path: Path) -> None:
+    """回归：版本号写着 2 但表缺 pseudo_id 时，必须能自愈。
+
+    真实踩过的坑——迁移只查 meta 版本号，元数据被提前写入后表永远修不好，
+    启动服务时报 `no such column: pseudo_id`。
+    """
+    import sqlite3
+
+    path = tmp_path / "broken.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE activities (activity_id INTEGER PRIMARY KEY, sport TEXT, date TEXT);
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO meta VALUES ('schema_version', '2');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as s:
+        cols = {r[1] for r in s._conn.execute("PRAGMA table_info(activities)")}
+        assert "pseudo_id" in cols
+        assert s.count_activities() == 0
+        assert s.upsert_activities([act(7)], source="x") == 1
+        assert s.count_activities() == 1
