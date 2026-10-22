@@ -10,7 +10,8 @@ FIT 是二进制格式，`fitdecode` 只读不写，因此这里手写一个只�
 - 文件尾 CRC 覆盖「14 字节 header + 数据」；header 内部那 2 字节 CRC 只覆盖前 12 字节
 - 时间的 epoch 是 1989-12-31T00:00:00Z
 - 带 scale 的字段写进去要乘回去：`enhanced_speed` ×1000、
-  `enhanced_altitude` ×5 再 +500 偏移量、`distance` ×100
+  `enhanced_altitude` ×5 再 +500 偏移量、`distance` ×100、
+  `training_stress_score` ×10、`intensity_factor` ×1000
 """
 
 from __future__ import annotations
@@ -70,6 +71,8 @@ def build_fit(
     with_records: bool = True,
     workout_rpe: int | None = None,
     workout_feel: int | None = None,
+    training_stress_score: float | None = None,
+    intensity_factor: float | None = None,
 ) -> bytes:
     """返回一个可被 fitdecode 解析的最小 FIT 文件字节串。
 
@@ -77,7 +80,8 @@ def build_fit(
     `with_session` / `with_records` 用来构造「不是活动」的边界样本。
 
     `workout_rpe` / `workout_feel` 是 session 级的主观评价（FIT 字段号 193 / 192）。
-    两者都是可选的——真实数据里 304 次活动只有 9 次填过，缺是常态。
+    `training_stress_score` / `intensity_factor` 是训练负荷（FIT 字段号 35 / 36）。
+    都是可选的——真实数据里 304 次活动 TSS 全空、RPE 只有 9 次填过，缺是常态。
     """
     data = bytearray()
 
@@ -107,6 +111,12 @@ def build_fit(
         if workout_rpe is not None:
             session_fields.append((193, 1, UINT8))
             payload.append(workout_rpe)
+        if training_stress_score is not None:
+            session_fields.append((35, 2, UINT16))
+            payload.extend(int(round(training_stress_score * 10)).to_bytes(2, "little"))
+        if intensity_factor is not None:
+            session_fields.append((36, 2, UINT16))
+            payload.extend(int(round(intensity_factor * 1000)).to_bytes(2, "little"))
         defmsg(1, _SESSION, session_fields)
         datamsg(1, bytes(payload))
 

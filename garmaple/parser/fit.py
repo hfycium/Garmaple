@@ -4,7 +4,7 @@
 没有「第 12 分钟心率多少」。逐秒数据只存在于导出包的 `UploadedFiles_*.zip`
 里那批 `.fit` 文件中，必须自己解。
 
-三条实测结论决定了这里的写法（真实导出包核对过）：
+四条实测结论决定了这里的写法（真实导出包核对过）：
 
 1. **`fitdecode` 默认已经应用了 FIT 的 scale / offset。** 返回的 `distance`
    就是米（末条与 `session.total_distance` 比值 1.0000），`enhanced_speed`
@@ -15,12 +15,17 @@
 3. **不是每个 `.fit` 都是活动。** 6487 个文件里只有 304 个含逐秒记录，
    其余是每日监测、睡眠阶段等。判据是「有 session 且有 record」，不能按
    文件名猜。
+4. **全量解析太慢。** fitdecode 逐文件全解约 432ms，6487 个文件 5 分钟。
+   只需要 session 级字段（训练负荷、开始时间）时用手写的轻量帧遍历
+   （`read_session_load`），实测全量 1.2 秒——record 载荷按定义尺寸跳过，
+   不进任何解析。
 """
 
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, BinaryIO, Iterable
 
 import fitdecode
@@ -150,6 +155,188 @@ def read_header(stream: BinaryIO, entry: int = 0) -> FitHeader:
         # 截断或损坏的文件不该让整个索引失败
         return FitHeader(entry=entry, time_created=None, kind=None)
     return FitHeader(entry=entry, time_created=time_created, kind=kind)
+
+
+@dataclass
+class FitLoad:
+    """FIT session 里的训练负荷字段 + 文件定位信息。
+
+    TSS 是 FIT `session` 消息的标准字段 `training_stress_score`（字段号 35，
+    scale 10）；IF 是 `intensity_factor`（字段号 36，scale 1000）。
+    本机设备没写过这两个字段（304 个活动全空），但格式里有——
+    有功率计或高端手表的导出会写满。留着是为了让那些数据也能用。
+    """
+
+    entry: int
+    kind: str | None
+    time_created: datetime | None
+    utc_start: datetime | None
+    tss: float | None = None
+    intensity_factor: float | None = None
+
+    @property
+    def is_activity(self) -> bool:
+        return self.kind == "activity"
+
+
+# file_id.type 的枚举值。fitdecode 把 4 解成字符串 "activity"，这里保持一致。
+# 其余类型在负荷提取里用不到，给编号当名字即可——is_activity 只看 == "activity"。
+_FIT_TYPE_NAMES = {1: "device", 4: "activity", 5: "workout", 32: "monitoring_b"}
+
+# FIT 消息全局号
+_FIT_MSG_FILE_ID = 0
+_FIT_MSG_SESSION = 18
+
+# 要解码的字段号（FIT Profile 里的 global message 字段定义号）
+_F_FILE_ID_TYPE = 0        # ENUM, 1 字节
+_F_FILE_ID_CREATED = 4     # UINT32, FIT epoch 秒
+_F_SESSION_START = 2       # UINT32, FIT epoch 秒
+_F_SESSION_TSS = 35        # UINT16, scale 10 → 存值 = TSS×10
+_F_SESSION_IF = 36         # UINT16, scale 1000 → 存值 = IF×1000
+
+# FIT 无效值约定
+_U16_INVALID = 0xFFFF
+_U32_INVALID = 0xFFFFFFFF
+
+
+def _fit_epoch(raw: int) -> datetime:
+    """FIT epoch 秒数（自 1989-12-31T00:00:00Z）转 aware UTC datetime。"""
+    return datetime(1989, 12, 31, tzinfo=timezone.utc) + timedelta(seconds=raw)
+
+
+def read_session_load(stream: BinaryIO, entry: int = 0) -> FitLoad:
+    """轻量遍历 FIT 帧结构，只解码 file_id 与 session 的训练负荷字段。
+
+    与 `parse_fit`（fitdecode 全解）的区别：不逐条解码 record，而是按
+    definition 里的字段尺寸直接跳过载荷。实测 6487 个文件全量扫描 1.2 秒
+    （fitdecode 全解要 5 分钟），因为 record 逐秒数据才是大头。
+
+    防御两种边界情形（真实数据里 0 个，但换个导出就可能有）：
+    - definition 消息头字节位 5 表示后面跟 developer field 定义，要一并跳过；
+    - 数据消息头字节位 7 是压缩时间戳头，载荷尺寸仍按 definition 走。
+    """
+    raw = stream.read()
+    if len(raw) < 14 or raw[8:12] != b".FIT":
+        return FitLoad(entry=entry, kind=None, time_created=None, utc_start=None)
+
+    header_size = raw[0]
+    if header_size not in (12, 14) or len(raw) < header_size + 2:
+        return FitLoad(entry=entry, kind=None, time_created=None, utc_start=None)
+
+    data_size = struct.unpack_from("<I", raw, 4)[0]
+    data_end = header_size + data_size
+    if data_end > len(raw):
+        return FitLoad(entry=entry, kind=None, time_created=None, utc_start=None)
+
+    # local_type → (global_num, big_endian, [(field_num, size)], total_payload_size)
+    defs: dict[int, tuple[int, bool, list[tuple[int, int]], int]] = {}
+
+    kind: str | None = None
+    time_created: datetime | None = None
+    utc_start: datetime | None = None
+    tss: float | None = None
+    intensity_factor: float | None = None
+
+    pos = header_size
+    while pos < data_end:
+        h = raw[pos]
+        pos += 1
+
+        # 压缩时间戳头：位 7 = 1，位 5-6 是 local_type，位 0-4 是时间偏移
+        if h & 0x80:
+            d = defs.get((h >> 5) & 0x03)
+            if d is None:
+                break
+            pos += d[3]
+            continue
+
+        # 定义消息：位 6 = 1
+        if h & 0x40:
+            local = h & 0x0F
+            has_dev = bool(h & 0x20)
+            if pos + 5 > data_end:
+                break
+            be = raw[pos + 1] != 0
+            gnum = struct.unpack_from(">H" if be else "<H", raw, pos + 2)[0]
+            nf = raw[pos + 4]
+            pos += 5
+
+            fields: list[tuple[int, int]] = []
+            psize = 0
+            for _ in range(nf):
+                if pos + 3 > data_end:
+                    break
+                fields.append((raw[pos], raw[pos + 1]))
+                psize += raw[pos + 1]
+                pos += 3
+
+            if has_dev:
+                if pos + 1 > data_end:
+                    break
+                nd = raw[pos]
+                pos += 1
+                for _ in range(nd):
+                    if pos + 3 > data_end:
+                        break
+                    psize += raw[pos + 1]  # developer field 也有 size
+                    pos += 3
+
+            defs[local] = (gnum, be, fields, psize)
+            continue
+
+        # 数据消息：位 6 = 0
+        d = defs.get(h & 0x0F)
+        if d is None:
+            break
+        gnum, be, fields, psize = d
+        if pos + psize > data_end:
+            break
+        payload = raw[pos : pos + psize]
+        pos += psize
+
+        fmt16 = ">H" if be else "<H"
+        fmt32 = ">I" if be else "<I"
+
+        if gnum == _FIT_MSG_FILE_ID and kind is None:
+            off = 0
+            for fnum, fsize in fields:
+                if off + fsize > len(payload):
+                    break
+                if fnum == _F_FILE_ID_TYPE and fsize >= 1:
+                    v = payload[off]
+                    kind = _FIT_TYPE_NAMES.get(v, str(v))
+                elif fnum == _F_FILE_ID_CREATED and fsize >= 4:
+                    v = struct.unpack_from(fmt32, payload, off)[0]
+                    if v != _U32_INVALID:
+                        time_created = _fit_epoch(v)
+                off += fsize
+        elif gnum == _FIT_MSG_SESSION and utc_start is None:
+            off = 0
+            for fnum, fsize in fields:
+                if off + fsize > len(payload):
+                    break
+                if fnum == _F_SESSION_START and fsize >= 4:
+                    v = struct.unpack_from(fmt32, payload, off)[0]
+                    if v != _U32_INVALID:
+                        utc_start = _fit_epoch(v)
+                elif fnum == _F_SESSION_TSS and fsize >= 2:
+                    v = struct.unpack_from(fmt16, payload, off)[0]
+                    if v != _U16_INVALID:
+                        tss = v / 10.0
+                elif fnum == _F_SESSION_IF and fsize >= 2:
+                    v = struct.unpack_from(fmt16, payload, off)[0]
+                    if v != _U16_INVALID:
+                        intensity_factor = v / 1000.0
+                off += fsize
+
+    return FitLoad(
+        entry=entry,
+        kind=kind,
+        time_created=time_created,
+        utc_start=utc_start,
+        tss=tss,
+        intensity_factor=intensity_factor,
+    )
 
 
 def parse_fit(stream: BinaryIO, entry: int = 0) -> FitStream | None:

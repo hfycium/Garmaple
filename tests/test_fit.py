@@ -23,6 +23,7 @@ from garmaple.parser.fit import (
     downsample,
     parse_fit,
     read_header,
+    read_session_load,
     sample_summary,
 )
 
@@ -242,3 +243,57 @@ def test_power_summary_omitted_without_power_data():
     # 功率峰值是有效指标（冲刺能力），不像速度会因 GPS 毛刺失真
     assert summary["power_avg_w"] == 202.0
     assert summary["power_max_w"] == 204
+
+
+# ---------------- 轻量 session walker ----------------
+
+
+def test_read_session_load_extracts_tss_and_if():
+    """TSS 是 FIT session 标准字段（号 35，scale 10），IF 是号 36（scale 1000）。"""
+    raw = build_fit(
+        start=START, samples=[sample_at(START, 0)],
+        training_stress_score=52.5, intensity_factor=0.85,
+    )
+    load = read_session_load(io.BytesIO(raw))
+    assert load.is_activity
+    assert load.tss == pytest.approx(52.5)
+    assert load.intensity_factor == pytest.approx(0.85)
+    assert load.utc_start == START
+    assert load.time_created == START
+
+
+def test_read_session_load_tss_absent_stays_none():
+    """没写就是 None，不要补 0——TSS 0 会被读成「训练负荷为零」。"""
+    raw = build_fit(start=START, samples=[sample_at(START, 0)])
+    load = read_session_load(io.BytesIO(raw))
+    assert load.tss is None
+    assert load.intensity_factor is None
+    assert load.utc_start == START
+
+
+def test_read_session_load_flags_non_activity():
+    raw = build_fit(start=START, samples=[sample_at(START, 0)], kind="monitoring_b")
+    load = read_session_load(io.BytesIO(raw))
+    assert not load.is_activity
+    assert load.kind == "monitoring_b"
+
+
+def test_read_session_load_survives_garbage():
+    load = read_session_load(io.BytesIO(b"\x0e\x10\x00\x00garbage"))
+    assert load.kind is None
+    assert load.tss is None
+    assert not load.is_activity
+
+
+def test_read_session_load_skips_record_payloads():
+    """record 载荷按 definition 的尺寸跳过，不会误把 record 数据当 session 解。
+
+    合成文件里 record 比 session 大得多（每条十几个字节 × 几百条），
+    如果 walker 在 record 上走错一步，session 的字段就会错位读到垃圾值。
+    """
+    many = [sample_at(START, i, hr=140, speed_mps=3.0, distance_m=3.0 * i) for i in range(100)]
+    raw = build_fit(start=START, samples=many, training_stress_score=80.0, intensity_factor=0.92)
+    load = read_session_load(io.BytesIO(raw))
+    assert load.tss == pytest.approx(80.0)
+    assert load.intensity_factor == pytest.approx(0.92)
+    assert load.utc_start == START
