@@ -115,3 +115,48 @@ def test_hr_zones_persisted(store: Store) -> None:
     assert row["hr_zone_3"] == 1800
     assert row["hr_zone_4"] == 900
     assert row["hr_zone_0"] == 0
+
+
+def test_pseudo_id_is_persisted_and_stable(store: Store) -> None:
+    from garmaple.privacy import pseudo_activity_id
+
+    row = store.query_activities(order="asc")[0]
+    assert row["pseudo_id"] == pseudo_activity_id(row["activity_id"])
+    assert row["pseudo_id"].startswith("act_")
+
+
+def test_find_activity_by_pseudo_id(store: Store) -> None:
+    row = store.query_activities(order="asc")[0]
+    found = store.find_activity(row["pseudo_id"])
+    assert found is not None
+    assert found["activity_id"] == row["activity_id"]
+
+
+def test_find_activity_by_raw_id(store: Store) -> None:
+    found = store.find_activity("1")
+    assert found is not None
+    assert found["activity_id"] == 1
+
+
+def test_find_activity_unknown_returns_none(store: Store) -> None:
+    assert store.find_activity("act_00000000") is None
+    assert store.find_activity("not-an-id") is None
+
+
+def test_schema_version_recorded(store: Store) -> None:
+    from garmaple.store import SCHEMA_VERSION
+
+    assert store.get_meta("schema_version") == str(SCHEMA_VERSION)
+
+
+def test_reopening_old_schema_rebuilds(tmp_path: Path) -> None:
+    """schema 版本不一致时应丢弃旧表而不是报错。"""
+    path = tmp_path / "old.sqlite3"
+    s = Store(path)
+    s.upsert_activities([act(1)], source="x")
+    s.set_meta("schema_version", "1")
+    s.close()
+
+    s2 = Store(path)  # 触发迁移
+    assert s2.count_activities() == 0
+    s2.close()

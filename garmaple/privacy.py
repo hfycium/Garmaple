@@ -25,6 +25,18 @@ _ID_SALT = "garmaple-v1"
 VALID_LEVELS = ("strict", "normal", "raw")
 
 
+def pseudo_activity_id(activity_id: int) -> str:
+    """把原始 activityId 映射为稳定的伪 ID。
+
+    与 privacy 级别无关——索引层需要用它建索引，
+    因此做成模块级纯函数，保证写入与查询两端算法一致。
+    """
+    digest = hashlib.blake2s(
+        f"{_ID_SALT}:{activity_id}".encode("utf-8"), digest_size=4
+    ).hexdigest()
+    return f"act_{digest}"
+
+
 @dataclass(frozen=True)
 class Privacy:
     level: str = "strict"
@@ -62,10 +74,7 @@ class Privacy:
         """
         if self.allows_raw_id:
             return str(activity_id)
-        digest = hashlib.blake2s(
-            f"{_ID_SALT}:{activity_id}".encode("utf-8"), digest_size=4
-        ).hexdigest()
-        return f"act_{digest}"
+        return pseudo_activity_id(activity_id)
 
     def when(self, utc: datetime | None, local: datetime | None) -> str | None:
         """strict 下只到日期；更高档位给出本地完整时间。"""

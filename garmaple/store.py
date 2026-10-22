@@ -17,12 +17,21 @@ from pathlib import Path
 from typing import Iterable
 
 from .parser.activities import Activity
+from .privacy import pseudo_activity_id
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+_META_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS activities (
     activity_id      INTEGER PRIMARY KEY,
+    pseudo_id        TEXT NOT NULL,
     sport            TEXT NOT NULL,
     name             TEXT,
     utc_start        TEXT,
@@ -61,17 +70,13 @@ CREATE TABLE IF NOT EXISTS activities (
     source           TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_activities_date  ON activities(date);
-CREATE INDEX IF NOT EXISTS idx_activities_sport ON activities(sport);
-
-CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
+CREATE INDEX IF NOT EXISTS idx_activities_date   ON activities(date);
+CREATE INDEX IF NOT EXISTS idx_activities_sport  ON activities(sport);
+CREATE INDEX IF NOT EXISTS idx_activities_pseudo ON activities(pseudo_id);
 """
 
 _COLUMNS = (
-    "activity_id", "sport", "name", "utc_start", "local_start", "date",
+    "activity_id", "pseudo_id", "sport", "name", "utc_start", "local_start", "date",
     "distance_m", "duration_s", "moving_s", "elapsed_s",
     "avg_hr", "max_hr", "calories",
     "elevation_gain_m", "elevation_loss_m",
@@ -92,7 +97,7 @@ def _row_tuple(act: Activity, source: str) -> tuple[object, ...]:
     local_date = act.local_start.date().isoformat() if act.local_start else None
     zones = (act.hr_zone_seconds + [None] * 7)[:7]
     return (
-        act.activity_id, act.sport, act.name,
+        act.activity_id, pseudo_activity_id(act.activity_id), act.sport, act.name,
         _iso(act.utc_start), _iso(act.local_start), local_date,
         act.distance_m, act.duration_s, act.moving_s, act.elapsed_s,
         act.avg_hr, act.max_hr, act.calories,
@@ -111,8 +116,19 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path)
         self._conn.row_factory = sqlite3.Row
+        self._conn.executescript(_META_SCHEMA)
+        self._migrate()
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """索引随时可从 data/ 重建，因此版本不匹配时直接丢弃旧表，不做增量迁移。"""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        if row and row["value"] != str(SCHEMA_VERSION):
+            self._conn.executescript("DROP TABLE IF EXISTS activities;")
+        self.set_meta("schema_version", str(SCHEMA_VERSION))
 
     def close(self) -> None:
         self._conn.close()
@@ -191,6 +207,25 @@ class Store:
             "SELECT sport, COUNT(*) AS n FROM activities GROUP BY sport ORDER BY n DESC"
         ).fetchall()
         return [r["sport"] for r in rows]
+
+    def find_activity(self, public_id: str) -> sqlite3.Row | None:
+        """按工具返回给 AI 的 ID 查找活动。
+
+        strict 下 AI 拿到的是伪 ID（`act_xxxxxxxx`），normal/raw 下可能是原始数字 ID，
+        两种都接受，避免切换隐私级别后工具调用失效。
+        """
+        pid = str(public_id).strip()
+        if pid.startswith("act_"):
+            return self._conn.execute(
+                "SELECT * FROM activities WHERE pseudo_id=?", (pid,)
+            ).fetchone()
+        try:
+            aid = int(pid)
+        except ValueError:
+            return None
+        return self._conn.execute(
+            "SELECT * FROM activities WHERE activity_id=?", (aid,)
+        ).fetchone()
 
     def date_range(self) -> tuple[str | None, str | None]:
         row = self._conn.execute(
