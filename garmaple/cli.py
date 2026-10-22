@@ -23,6 +23,9 @@ from .parser.daily import parse_days
 from .parser.metrics import RacePrediction, Vo2maxSample
 from .parser.metrics import dedupe_predictions, dedupe_vo2max
 from .parser.metrics import parse_race_predictions, parse_vo2max_samples
+from .parser.records import Gear, PersonalRecord
+from .parser.records import dedupe_gears, dedupe_records
+from .parser.records import parse_gears, parse_records
 from .parser.sleep import STATUS_OK, SleepRecord
 from .parser.sleep import dedupe as dedupe_sleeps
 from .parser.sleep import parse_sleeps
@@ -37,6 +40,8 @@ SLEEP_GLOB = "*sleepData.json"
 TRAINING_GLOB = "TrainingHistory_*.json"
 RACE_GLOB = "RunRacePredictions_*.json"
 VO2MAX_GLOB = "MetricsMaxMetData_*.json"
+PERSONAL_GLOB = "*personalRecord.json"
+GEAR_GLOB = "*gear.json"
 
 
 def _force_utf8() -> None:
@@ -153,6 +158,34 @@ def cmd_index(cfg: Config) -> int:
                 f"（同日合并后 {len(vo2maxes)} 天）"
             )
 
+        # 个人最佳：一次导出只有一份，多次导出按 personalRecordId 去重
+        personal: list[PersonalRecord] = []
+        personal_shards = dataset.find_all(PERSONAL_GLOB)
+        for archive, name in personal_shards:
+            personal.extend(parse_records(archive.read_json(name)))
+        raw_personal = len(personal)
+        personal = dedupe_records(personal)
+        if personal_shards:
+            current = sum(1 for r in personal if r.current)
+            print(
+                f"个人最佳   {len(personal_shards)} 个 → {raw_personal} 条"
+                f"（去重后 {len(personal)} 条，其中当前 {current} 条）"
+            )
+
+        # 装备：里程要靠关联活动求和，因此必须在活动之后解析
+        gears: list[Gear] = []
+        gear_shards = dataset.find_all(GEAR_GLOB)
+        for archive, name in gear_shards:
+            gears.extend(parse_gears(archive.read_json(name)))
+        raw_gears = len(gears)
+        gears = dedupe_gears(gears)
+        if gear_shards:
+            linked = sum(len(g.activity_ids) for g in gears)
+            print(
+                f"装备       {len(gear_shards)} 个 → {raw_gears} 双"
+                f"（去重后 {len(gears)} 双，关联活动 {linked} 次）"
+            )
+
         _hr("概览")
         print(f"活动总数   {len(deduped)} 条" + (
             f"（原始 {len(activities)} 条，去重 {len(activities) - len(deduped)} 条）"
@@ -192,6 +225,18 @@ def cmd_index(cfg: Config) -> int:
             print("最大摄氧量 解析结果为空，跳过")
         else:
             print("最大摄氧量 归档中没有 MetricsMaxMetData_*.json，跳过")
+        if personal:
+            print(f"个人最佳   {len(personal)} 条（当前有效 {sum(1 for r in personal if r.current)} 条）")
+        elif personal_shards:
+            print("个人最佳   解析结果为空，跳过")
+        else:
+            print("个人最佳   归档中没有 *personalRecord.json，跳过")
+        if gears:
+            print(f"装备       {len(gears)} 双")
+        elif gear_shards:
+            print("装备       解析结果为空，跳过")
+        else:
+            print("装备       归档中没有 *gear.json，跳过")
 
         with Store(cfg.db_path) as store:
             store.upsert_activities(deduped, source=dataset.archives[0].label)
@@ -205,6 +250,10 @@ def cmd_index(cfg: Config) -> int:
                 store.upsert_race_predictions(races, source=dataset.archives[0].label)
             if vo2maxes:
                 store.upsert_vo2max(vo2maxes, source=dataset.archives[0].label)
+            if personal:
+                store.upsert_personal_records(personal, source=dataset.archives[0].label)
+            if gears:
+                store.upsert_gears(gears, source=dataset.archives[0].label)
             store.set_meta("indexed_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
             store.set_meta("source", dataset.archives[0].label)
             total = store.count_activities()
@@ -213,6 +262,8 @@ def cmd_index(cfg: Config) -> int:
             total_training = store.count_training()
             total_races = store.count_race_predictions()
             total_vo2max = store.count_vo2max()
+            total_personal = store.count_personal_records()
+            total_gears = store.count_gears()
 
         _hr("索引")
         print(f"写入位置   {cfg.db_path}")
@@ -222,6 +273,8 @@ def cmd_index(cfg: Config) -> int:
         print(f"库内训练   {total_training} 天")
         print(f"库内预测   {total_races} 天")
         print(f"库内摄氧量 {total_vo2max} 天")
+        print(f"库内纪录   {total_personal} 条")
+        print(f"库内装备   {total_gears} 双")
 
     print(f"\n完成。隐私级别 {cfg.privacy}（strict 下坐标与地点不会进入 AI 上下文）")
     return 0
@@ -253,6 +306,10 @@ def cmd_doctor(cfg: Config) -> int:
             print(f"预测分片   {len(race_shards)} 个")
             vo2max_shards = dataset.find_all(VO2MAX_GLOB)
             print(f"摄氧量分片 {len(vo2max_shards)} 个")
+            personal_shards = dataset.find_all(PERSONAL_GLOB)
+            print(f"纪录分片   {len(personal_shards)} 个")
+            gear_shards = dataset.find_all(GEAR_GLOB)
+            print(f"装备分片   {len(gear_shards)} 个")
             fits = dataset.find_one("UploadedFiles_*.zip")
             if fits:
                 with fits[0].nested(fits[1]) as nested:
@@ -285,6 +342,10 @@ def cmd_doctor(cfg: Config) -> int:
             nv = store.count_vo2max()
             vlo, vhi = store.vo2max_range()
             print(f"最大摄氧量 {nv} 天" + (f"（{vlo} → {vhi}）" if nv else ""))
+            np_ = store.count_personal_records()
+            print(f"个人最佳   {np_} 条")
+            ng = store.count_gears()
+            print(f"装备       {ng} 双")
             print(f"上次索引   {store.get_meta('indexed_at') or '未知'}")
             ok &= n > 0
     else:

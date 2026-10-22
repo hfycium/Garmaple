@@ -18,6 +18,7 @@ from garmaple.store import Store
 from .test_activities import make_raw
 from .test_daily import make_block
 from .test_metrics import make_prediction, make_vo2max
+from .test_records import make_gear, make_gear_payload, make_raw as make_record
 from .test_sleep import make_sleep
 from .test_training import make_block as make_training
 
@@ -40,11 +41,14 @@ def build_archive(
     training: int | None = None,
     races: int | None = None,
     vo2max: int | None = None,
+    personal: int | None = None,
+    gears: int | None = None,
 ) -> Path:
-    """造一个最小导出包：活动 + 日汇总 + 睡眠 + 训练状态 + 预测 + 摄氧量。
+    """造一个最小导出包：活动 + 日汇总 + 睡眠 + 训练 + 预测 + 摄氧量 + 纪录 + 装备。
 
     `sleeps` / `training` / `races` / `vo2max` 为 None 时与 `days` 同天数；
-    显式传 0 则不写对应分片，用于验证「缺这份数据也能正常索引」。
+    `personal` / `gears` 为 None 时各写 2 条。显式传 0 则不写对应分片，
+    用于验证「缺这份数据也能正常索引」。
     """
     path = root / "export.zip"
     payload = [{"summarizedActivitiesExport": [
@@ -101,6 +105,35 @@ def build_archive(
         )
         for i in range(vo2_count)
     ]
+    personal_count = 2 if personal is None else personal
+    personal_block = [
+        {
+            "personalRecords": [
+                make_record(
+                    recordId=900001, recordType="Best 5km Run", value=1108.3,
+                    activityId=1000, created="2026-07-20",
+                ),
+                make_record(
+                    recordId=900002, recordType="Farthest Run", value=21116.4,
+                    activityId=1001, created="2026-07-21",
+                ),
+            ][:personal_count]
+        }
+    ]
+    gear_count = 2 if gears is None else gears
+    # 一双有关联、一双没有——复刻实测情形：有装备的关联键整个不存在
+    gear_block = make_gear_payload(
+        [
+            make_gear(gearPk=700001, name="测试跑鞋甲"),
+            make_gear(gearPk=700002, name="测试跑鞋乙"),
+        ][:gear_count],
+        {
+            "700001": [
+                {"gearPk": 700001, "activityId": 1000},
+                {"gearPk": 700001, "activityId": 1001},
+            ]
+        },
+    )
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr(
             "DI_CONNECT/DI-Connect-Fitness/9000_1_summarizedActivities.json",
@@ -130,6 +163,16 @@ def build_archive(
                 "DI_CONNECT/DI-Connect-Metrics/MetricsMaxMetData_2026-07-20_2026-07-30_999.json",
                 json.dumps(vo2),
             )
+        if personal_count:
+            zf.writestr(
+                "DI_CONNECT/DI-Connect-Fitness/9000_personalRecord.json",
+                json.dumps(personal_block),
+            )
+        if gear_count:
+            zf.writestr(
+                "DI_CONNECT/DI-Connect-Fitness/9000_gear.json",
+                json.dumps(gear_block),
+            )
     return path
 
 
@@ -147,12 +190,15 @@ def test_index_builds_both_tables(tmp_path: Path, capsys) -> None:
     out = capsys.readouterr().out
     assert "活动分片" in out and "日汇总分片" in out and "睡眠分片" in out
     assert "训练分片" in out and "比赛预测" in out and "最大摄氧量" in out
+    assert "个人最佳" in out and "装备" in out
     assert "库内活动   2 条" in out
     assert "库内日汇总 2 天" in out
     assert "库内睡眠   2 晚" in out
     assert "库内训练   2 天" in out
     assert "库内预测   2 天" in out
     assert "库内摄氧量 2 天" in out
+    assert "库内纪录   2 条" in out
+    assert "库内装备   2 双" in out
 
     with Store(cfg.db_path) as store:
         assert store.count_activities() == 2
@@ -161,6 +207,40 @@ def test_index_builds_both_tables(tmp_path: Path, capsys) -> None:
         assert store.count_training() == 2
         assert store.count_race_predictions() == 2
         assert store.count_vo2max() == 2
+        assert store.count_personal_records() == 2
+        assert store.count_gears() == 2
+
+
+def test_index_computes_gear_mileage_from_activities(tmp_path: Path) -> None:
+    """装备里程是关联活动求和：两条各 10km，合计 20km。"""
+    cfg = make_config(tmp_path)
+    main(["--data", str(cfg.data_dir), "--cache", str(cfg.cache_dir), "index"])
+    with Store(cfg.db_path) as store:
+        usage = store.gear_usage()
+    assert usage[700001].activity_count == 2
+    assert usage[700001].distance_m == 20000.0
+    # 第二双没有关联键，里程必须是「没有」而不是 0
+    assert usage[700002].activity_count == 0
+    assert usage[700002].distance_m is None
+
+
+def test_index_without_personal_and_gear_shards_still_works(
+    tmp_path: Path, capsys
+) -> None:
+    """没有纪录与装备时只跳过，不该整体失败。"""
+    data = tmp_path / "data"
+    data.mkdir()
+    build_archive(data, personal=0, gears=0)
+    cfg = Config(data_dir=data, cache_dir=tmp_path / "cache")
+
+    assert main(["--data", str(cfg.data_dir), "--cache", str(cfg.cache_dir), "index"]) == 0
+    out = capsys.readouterr().out
+    assert "归档中没有 *personalRecord.json" in out
+    assert "归档中没有 *gear.json" in out
+    with Store(cfg.db_path) as store:
+        assert store.count_personal_records() == 0
+        assert store.count_gears() == 0
+        assert store.count_activities() == 2
 
 
 def test_index_merges_same_day_race_snapshots(tmp_path: Path) -> None:
@@ -279,6 +359,8 @@ def test_doctor_reports_counts(tmp_path: Path, capsys) -> None:
     assert "训练状态   2 天" in out
     assert "比赛预测   2 天" in out
     assert "最大摄氧量 2 天" in out
+    assert "个人最佳   2 条" in out
+    assert "装备       2 双" in out
     assert "一切就绪" in out
 
 
