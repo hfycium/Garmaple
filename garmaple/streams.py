@@ -20,7 +20,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from .archive import Archive, Dataset
-from .parser.fit import FitStream, parse_fit, read_header
+from .parser.fit import FitStream, parse_fit, read_session_load
 
 # 候选窗口。实测 `time_created` 最早出现在活动进行中、最晚比活动结束晚 37 分钟，
 # 两头都留 2 小时，宁可贵一点点也不要漏配。
@@ -42,16 +42,20 @@ def _open_fits(archive: Archive) -> tuple[Archive, list[str]] | None:
     return nested, [n for n in nested.names if n.lower().endswith(".fit")]
 
 
-def scan_activity_fits(dataset: Dataset) -> list[tuple[int, int, str | None]]:
-    """扫描全部归档，返回活动 FIT 的定位。
+def scan_activity_fits(
+    dataset: Dataset,
+) -> list[tuple[int, int, str | None, str | None, float | None, float | None]]:
+    """扫描全部归档，返回活动 FIT 的定位与训练负荷。
 
-    每项是 `(archive_idx, entry_idx, time_created)`：`archive_idx` 是该归档在
-    `Dataset.archives` 里的序号，`entry_idx` 是内嵌 zip 里第几个 `.fit`。
-    **不返回文件名**，因为文件名里带设备序列号。
+    每项是 `(archive_idx, entry_idx, time_created, utc_start, tss, intensity_factor)`：
+    `archive_idx` 是该归档在 `Dataset.archives` 里的序号，`entry_idx` 是内嵌
+    zip 里第几个 `.fit`。**不返回文件名**，因为文件名里带设备序列号。
 
-    只读每个文件开头的 `file_id` 帧，6487 个文件约 2 秒；完整解析要 5 分钟。
+    用轻量帧遍历（`read_session_load`）而不是 fitdecode 全解：只解码
+    file_id 与 session，record 按尺寸跳过。6487 个文件实测 1.2 秒
+    （fitdecode 要 5 分钟），TSS / IF / session 开始时间一次拿到。
     """
-    rows: list[tuple[int, int, str | None]] = []
+    rows: list[tuple[int, int, str | None, str | None, float | None, float | None]] = []
     for aidx, archive in enumerate(dataset.archives):
         opened = _open_fits(archive)
         if opened is None:
@@ -59,12 +63,19 @@ def scan_activity_fits(dataset: Dataset) -> list[tuple[int, int, str | None]]:
         nested, fits = opened
         for eidx, entry in enumerate(fits):
             with nested.open(entry) as fh:
-                header = read_header(fh, entry=eidx)
-            if not header.is_activity:
+                load = read_session_load(fh, entry=eidx)
+            if not load.is_activity:
                 continue
-            created = header.time_created
+            created = load.time_created
             rows.append(
-                (aidx, eidx, created.strftime("%Y-%m-%dT%H:%M:%S") if created else None)
+                (
+                    aidx,
+                    eidx,
+                    created.strftime("%Y-%m-%dT%H:%M:%S") if created else None,
+                    load.utc_start.isoformat() if load.utc_start else None,
+                    load.tss,
+                    load.intensity_factor,
+                )
             )
     return rows
 

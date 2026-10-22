@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -24,7 +24,7 @@ from .parser.sleep import STATUS_OK, SleepRecord
 from .parser.training import TrainingDay
 from .privacy import pseudo_activity_id
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 _META_SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -280,12 +280,20 @@ _GEAR_COLUMNS = (
 # 定位方式见 parser/fit.py：file_id.type == "activity" 正好圈出全部活动文件。
 #
 # time_created 不等于活动开始时间（设备在保存文件时才写），实测落在活动区间
-# 附近，因此只用于缩小候选，真正对齐仍要靠 session.start_time。
+# 附近，因此只用于缩小候选，真正对齐仍要靠 session.start_time（存 utc_start）。
+#
+# tss / intensity_factor 来自 FIT session 的标准字段（号 35 / 36）。
+# 本机设备没写过（全空），但格式里有——有功率计的导出会写满。
+# utc_start 是 session.start_time（FIT epoch 转 aware UTC），用于和活动按
+# ±1 秒匹配得到本地日期，算 CTL / ATL / TSB 的每日 TSS 序列。
 _FIT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS fit_files (
-    archive_idx  INTEGER NOT NULL,
-    entry_idx    INTEGER NOT NULL,
-    time_created TEXT,
+    archive_idx       INTEGER NOT NULL,
+    entry_idx         INTEGER NOT NULL,
+    time_created      TEXT,
+    utc_start         TEXT,
+    tss               REAL,
+    intensity_factor  REAL,
     PRIMARY KEY (archive_idx, entry_idx)
 );
 
@@ -610,7 +618,7 @@ class Store:
         "personal_records": frozenset({"record_id", "type", "value", "current"}),
         "gears": frozenset({"gear_id", "name", "max_meters"}),
         "gear_activities": frozenset({"gear_id", "pseudo_id"}),
-        "fit_files": frozenset({"archive_idx", "entry_idx", "time_created"}),
+        "fit_files": frozenset({"archive_idx", "entry_idx", "time_created", "utc_start", "tss", "intensity_factor"}),
     }
 
     def _migrate(self) -> None:
@@ -806,9 +814,13 @@ class Store:
                     )
         return len(items)
 
-    def upsert_fit_files(self, rows: Iterable[tuple[int, int, str | None]]) -> int:
-        """写入逐秒记录的定位表，元素为 (archive_idx, entry_idx, time_created)。
+    def upsert_fit_files(
+        self,
+        rows: Iterable[tuple[int, int, str | None, str | None, float | None, float | None]],
+    ) -> int:
+        """写入逐秒记录的定位与负荷表。
 
+        元素为 (archive_idx, entry_idx, time_created, utc_start, tss, intensity_factor)。
         整表重建而不是增量：条目下标只在当次扫描里有意义，多个归档包的顺序
         也可能因为新增包而变化，留着旧行会指到错误的文件上。
         """
@@ -817,8 +829,9 @@ class Store:
             self._conn.execute("DELETE FROM fit_files")
             if items:
                 self._conn.executemany(
-                    "INSERT OR REPLACE INTO fit_files (archive_idx, entry_idx, time_created) "
-                    "VALUES (?, ?, ?)",
+                    "INSERT OR REPLACE INTO fit_files "
+                    "(archive_idx, entry_idx, time_created, utc_start, tss, intensity_factor) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
                     items,
                 )
         return len(items)
@@ -856,6 +869,62 @@ class Store:
     def count_fit_files(self) -> int:
         """有逐秒记录的活动文件数。用来判断要不要提示重跑 index。"""
         return self._conn.execute("SELECT COUNT(*) AS n FROM fit_files").fetchone()["n"]
+
+    def count_fit_loads(self) -> int:
+        """有 TSS 数据的 FIT 文件数。用来判断 get_training_load 是否有输入。"""
+        return self._conn.execute(
+            "SELECT COUNT(*) AS n FROM fit_files WHERE tss IS NOT NULL"
+        ).fetchone()["n"]
+
+    def daily_tss(self) -> list[tuple[str, float]]:
+        """按本地日期汇总 TSS，用于 CTL / ATL / TSB 计算。
+
+        FIT 的 `session.start_time`（存 utc_start）与活动摘要的 `utc_start`
+        按 ±1 秒容差匹配（`_same_moment` 同款逻辑），取活动的本地 `date` 做键。
+        匹配不上的 TSS 用 UTC 日期兜底——宁可日期略有偏差也不要丢负荷。
+        """
+        fits = self._conn.execute(
+            "SELECT utc_start, tss FROM fit_files "
+            "WHERE tss IS NOT NULL AND utc_start IS NOT NULL"
+        ).fetchall()
+        if not fits:
+            return []
+
+        acts = self._conn.execute(
+            "SELECT utc_start, date FROM activities WHERE utc_start IS NOT NULL"
+        ).fetchall()
+
+        def _epoch(text: str | None) -> int | None:
+            if not text:
+                return None
+            try:
+                dt = datetime.fromisoformat(str(text))
+            except ValueError:
+                return None
+            return int(dt.timestamp())
+
+        act_map: dict[int, str] = {}
+        for a in acts:
+            ts = _epoch(a["utc_start"])
+            if ts is not None and a["date"]:
+                act_map[ts] = a["date"]
+
+        by_date: dict[str, float] = {}
+        for f in fits:
+            ts = _epoch(f["utc_start"])
+            if ts is None:
+                continue
+            date_str = (
+                act_map.get(ts)
+                or act_map.get(ts - 1)
+                or act_map.get(ts + 1)
+            )
+            if date_str is None:
+                # 兜底：用 UTC 日期。比丢掉负荷好
+                date_str = datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+            by_date[date_str] = by_date.get(date_str, 0.0) + (f["tss"] or 0.0)
+
+        return sorted(by_date.items())
 
     def fit_candidates(
         self, time_from: datetime, time_to: datetime

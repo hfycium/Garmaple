@@ -435,7 +435,7 @@ def test_index_and_doctor_report_fit_coverage(tmp_path: Path, capsys) -> None:
 
     assert main(args + ["index"]) == 0
     out = capsys.readouterr().out
-    assert "逐秒记录   1 个活动 FIT（仅索引文件头）" in out
+    assert "逐秒记录   1 个活动 FIT" in out
     assert "逐秒记录   1 次活动可查" in out
 
     assert main(args + ["doctor"]) == 0

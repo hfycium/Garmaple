@@ -188,15 +188,18 @@ def cmd_index(cfg: Config) -> int:
                 f"（去重后 {len(gears)} 双，关联活动 {linked} 次）"
             )
 
-        # 逐秒记录（FIT）：只读每个文件的 file_id 帧，约 2 秒就能拿到全部活动
-        # 文件的定位；完整解析要 5 分钟，因此索引阶段不做，查询时按需解析。
-        fit_rows: list[tuple[int, int, str | None]] = []
+        # 逐秒记录（FIT）：用轻量帧遍历（1.2 秒扫全部文件）拿到活动 FIT 的
+        # 定位与 session 训练负荷（TSS / IF）；完整解析逐秒数据要 5 分钟，
+        # 因此索引阶段不做，查询时按需解析。
+        fit_rows: list[tuple[int, int, str | None, str | None, float | None, float | None]] = []
         try:
             fit_rows = scan_activity_fits(dataset)
         except (BadZipFile, ArchiveError):
             fit_rows = []
         if fit_rows:
-            print(f"逐秒记录   {len(fit_rows)} 个活动 FIT（仅索引文件头）")
+            tss_count = sum(1 for r in fit_rows if r[4] is not None)
+            tss_note = f"，其中 {tss_count} 条有 TSS" if tss_count else ""
+            print(f"逐秒记录   {len(fit_rows)} 个活动 FIT（含训练负荷{tss_note}）")
         else:
             print("逐秒记录   归档中没有内嵌的 .fit，逐秒工具将不可用")
 
@@ -350,6 +353,11 @@ def cmd_doctor(cfg: Config) -> int:
             nf = store.count_fit_files()
             if nf:
                 print(f"逐秒记录   {nf}/{n} 条活动有 FIT 文件")
+                nl = store.count_fit_loads()
+                if nl:
+                    print(f"训练负荷   {nl} 条活动有 TSS 数据")
+                else:
+                    print("训练负荷   无（本机设备不写 TSS，属格式支持但设备未启用）")
             else:
                 print("逐秒记录   无（归档不含内嵌 .fit，或索引版本过旧需重跑 index）")
             nd = store.count_days()
