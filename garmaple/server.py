@@ -367,6 +367,8 @@ def build_server(cfg: Config) -> Any:
             picks,
             total=len(stream.samples),
             summary=sample_summary(stream.samples),
+            workout_rpe=stream.workout_rpe,
+            workout_feel=stream.workout_feel,
         )
 
     @mcp.tool()

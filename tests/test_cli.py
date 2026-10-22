@@ -50,6 +50,9 @@ def build_archive(
     gears: int | None = None,
     superseded: bool = False,
     fits: int = 0,
+    workout_rpe: int | None = None,
+    workout_feel: int | None = None,
+    power_w: int | None = None,
 ) -> Path:
     """造一个最小导出包：活动 + 日汇总 + 睡眠 + 训练 + 预测 + 摄氧量 + 纪录 + 装备。
 
@@ -208,6 +211,8 @@ def build_archive(
                         f"0000000000000_{i}.fit",
                         build_fit(
                             start=base,
+                            workout_rpe=workout_rpe,
+                            workout_feel=workout_feel,
                             samples=[
                                 sample_at(
                                     base,
@@ -220,6 +225,7 @@ def build_archive(
                                     altitude_m=20.0 + sec / 100,
                                     cadence=85,
                                     distance_m=3.0 * sec,
+                                    power_w=power_w,
                                 )
                                 for sec in range(0, 1300, 2)
                             ],

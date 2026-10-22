@@ -23,10 +23,10 @@ from garmaple.privacy import pseudo_activity_id
 from .test_cli import build_archive
 
 
-def prepared(tmp_path: Path, days: int = 3, privacy: str = "strict", fits: int = 0) -> Config:
+def prepared(tmp_path: Path, days: int = 3, privacy: str = "strict", fits: int = 0, **kwargs) -> Config:
     data = tmp_path / "data"
     data.mkdir(parents=True, exist_ok=True)
-    build_archive(data, activities=2, days=days, fits=fits)
+    build_archive(data, activities=2, days=days, fits=fits, **kwargs)
     cfg = Config(data_dir=data, cache_dir=tmp_path / "cache", privacy=privacy)
     main(["--data", str(cfg.data_dir), "--cache", str(cfg.cache_dir), "index"])
     return cfg
@@ -811,3 +811,53 @@ def test_pace_hr_drift_unknown_activity(tmp_path: Path) -> None:
     cfg = prepared(tmp_path, fits=1)
     out = call(cfg, "get_pace_hr_drift", {"activity_id": "act_不存在"})
     assert out["error"] == "未找到该活动"
+
+
+# ---------------- 主观评价与功率 ----------------
+
+
+def test_streams_reports_perceived_effort(tmp_path: Path) -> None:
+    """主观评价单独成块，且 RPE 已换算成 Borg CR10。
+
+    FIT 里存的是 Borg CR10 × 10，写 80 实际是 Borg 8.0。不换算的话模型
+    会读成「RPE 80」，量纲就错了。
+    """
+    cfg = prepared(tmp_path, fits=1, workout_rpe=80, workout_feel=25)
+    out = call(cfg, "get_activity_streams", {"activity_id": pseudo_activity_id(1000)})
+
+    assert out["perceived"] == {"rpe": 8.0, "feel": 25}
+    assert "Borg" in out["perceived_note"]
+    assert "0–100" in out["perceived_note"]
+
+
+def test_streams_omits_perceived_when_not_recorded(tmp_path: Path) -> None:
+    """没填就不输出——本机 304 次活动只有 9 次填过，缺是常态。"""
+    cfg = prepared(tmp_path, fits=1)
+    out = call(cfg, "get_activity_streams", {"activity_id": pseudo_activity_id(1000)})
+
+    assert "perceived" not in out
+    assert "perceived_note" not in out
+
+
+def test_streams_carries_power_when_power_meter_present(tmp_path: Path) -> None:
+    """功率是 FIT record 的标准字段，有功率计的导出就该带出来。
+
+    本机设备没功率计（304 个活动一次没写过），所以这里用合成数据验证，
+    好让有功率计的用户拿到的不是空序列。
+    """
+    cfg = prepared(tmp_path, fits=1, power_w=180)
+    out = call(cfg, "get_activity_streams", {"activity_id": pseudo_activity_id(1000)})
+
+    assert "power_w" in out["series"]
+    assert out["series"]["power_w"][0] == 180
+    assert out["summary"]["power_max_w"] == 180
+    assert "power_w" not in out.get("series_missing", [])
+
+
+def test_streams_without_power_leaves_power_column_out(tmp_path: Path) -> None:
+    """整列为空就不输出，和室内活动不出配速列是同一条规矩。"""
+    cfg = prepared(tmp_path, fits=1)
+    out = call(cfg, "get_activity_streams", {"activity_id": pseudo_activity_id(1000)})
+
+    assert "power_w" not in out["series"]
+    assert "power_w" in out["series_missing"]

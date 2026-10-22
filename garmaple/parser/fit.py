@@ -28,7 +28,12 @@ import fitdecode
 
 @dataclass
 class FitSample:
-    """一个采样点。字段缺失时保持 None，不要补 0——补 0 会拉低平均值。"""
+    """一个采样点。字段缺失时保持 None，不要补 0——补 0 会拉低平均值。
+
+    `power_w` 是 FIT `record` 的标准字段 `power`（瓦特）。本机设备没功率计，
+    304 个活动一次都没写过，但格式里是有的——留着是为了让有功率计的导出
+    也能用，不要因为「我这份数据取不到」就把它删掉。
+    """
 
     offset_s: int
     hr: int | None = None
@@ -36,6 +41,7 @@ class FitSample:
     altitude_m: float | None = None
     cadence: int | None = None
     distance_m: float | None = None
+    power_w: int | None = None
 
 
 @dataclass
@@ -46,6 +52,11 @@ class FitStream:
     sport: str | None = None
     sub_sport: str | None = None
     samples: list[FitSample] = field(default_factory=list)
+    # 主观评价，来自 FIT session 的 workout_rpe / workout_feel。
+    # 本机 304 个活动里有 9 个写了这两个字段，是少见的「设备写了但没人读」的情况。
+    # rpe 已换算成 Borg CR10（0–10）；feel 是 0–100 分，低=差、高=好。
+    workout_rpe: float | None = None
+    workout_feel: int | None = None
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -178,6 +189,7 @@ def parse_fit(stream: BinaryIO, entry: int = 0) -> FitStream | None:
                 altitude_m=_as_float(rec.get("enhanced_altitude")),
                 cadence=_as_int(rec.get("cadence")),
                 distance_m=_as_float(rec.get("distance")),
+                power_w=_as_int(rec.get("power")),
             )
         )
 
@@ -186,11 +198,19 @@ def parse_fit(stream: BinaryIO, entry: int = 0) -> FitStream | None:
 
     sport = session.get("sport")
     sub_sport = session.get("sub_sport")
+    rpe = _as_int(session.get("workout_rpe"))
+    feel = _as_int(session.get("workout_feel"))
     return FitStream(
         utc_start=start,
         sport=str(sport) if sport is not None else None,
         sub_sport=str(sub_sport) if sub_sport is not None else None,
         samples=samples,
+        # workout_rpe 在 FIT 里是 Borg CR10（0–10）量表**乘以 10** 存的，
+        # 所以 80 表示 Borg 8.0 而不是「RPE 80」。这里除回来，避免下游误读。
+        workout_rpe=round(rpe / 10.0, 1) if rpe is not None else None,
+        # workout_feel 是 0–100 分，低=感觉差、高=感觉好（FIT Profile 原文如此，
+        # 没有给离散档位，所以不映射成「好/差」这类标签）。
+        workout_feel=feel,
     )
 
 
@@ -220,7 +240,8 @@ def sample_summary(samples: Iterable[FitSample]) -> dict[str, Any]:
     speeds = [s.speed_mps for s in items if s.speed_mps is not None]
     alts = [s.altitude_m for s in items if s.altitude_m is not None]
     cads = [s.cadence for s in items if s.cadence is not None]
-    return {
+    powers = [s.power_w for s in items if s.power_w is not None]
+    out: dict[str, Any] = {
         "points": len(items),
         "hr_min": min(hrs) if hrs else None,
         "hr_max": max(hrs) if hrs else None,
@@ -231,6 +252,11 @@ def sample_summary(samples: Iterable[FitSample]) -> dict[str, Any]:
         "altitude_max_m": round(max(alts), 1) if alts else None,
         "cadence_max": max(cads) if cads else None,
     }
+    if powers:
+        # 功率的峰值是有效指标（冲刺能力），不像速度会因 GPS 毛刺失真，所以给最大值。
+        out["power_avg_w"] = round(sum(powers) / len(powers), 1)
+        out["power_max_w"] = max(powers)
+    return out
 
 
 def percentile(values: list[float], fraction: float) -> float:

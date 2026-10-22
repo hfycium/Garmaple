@@ -228,6 +228,8 @@ class Privacy:
         samples: list[FitSample],
         total: int,
         summary: dict[str, object],
+        workout_rpe: float | None = None,
+        workout_feel: int | None = None,
     ) -> dict[str, object]:
         """单次活动的逐秒曲线。
 
@@ -248,6 +250,7 @@ class Privacy:
                 round(s.altitude_m, 1) if s.altitude_m is not None else None for s in samples
             ],
             "cadence": [s.cadence for s in samples],
+            "power_w": [s.power_w for s in samples],
         }
         # 整列都是 None 就不输出。室内活动只有心率，把 pace/altitude/cadence
         # 三列的空数组一起塞进去既浪费体积，也容易被读成「配速为零」。
@@ -271,6 +274,21 @@ class Privacy:
         }
         if absent:
             out["series_missing"] = absent
+        # 主观评价是用户在手表上自己填的，不是设备测的。本机 304 次活动里只有
+        # 9 次填过，缺是常态，所以单独成块而不是平铺进 summary——避免被读成
+        # 「RPE 为 0」这种不存在的结论。没填的那个键直接省略。
+        perceived = {
+            k: v
+            for k, v in (("rpe", workout_rpe), ("feel", workout_feel))
+            if v is not None
+        }
+        if perceived:
+            out["perceived"] = perceived
+            out["perceived_note"] = (
+                "rpe 是 Borg CR10 量表（0–10，数字越大越吃力）；"
+                "feel 是 0–100 分，低=当时感觉差、高=感觉好。"
+                "两个都是运动后自己填的主观感受，不是仪器测量值。"
+            )
         return self._strip_none(out)
 
     def drift(self, act: Activity, result: dict[str, object]) -> dict[str, object]:

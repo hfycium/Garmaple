@@ -187,3 +187,58 @@ def test_percentile_interpolates():
     assert percentile([1, 2], 1.0) == 2
     with pytest.raises(ValueError):
         percentile([], 0.5)
+
+
+# ---------------- 主观评价与功率 ----------------
+
+
+def test_workout_rpe_is_converted_from_borg_cr10_times_ten():
+    """`workout_rpe` 在 FIT 里是 Borg CR10（0–10）**乘以 10** 存的。
+
+    真实数据里出现过 80 / 70 / 10 / 100，照原样返回会被读成「RPE 80」，
+    而它其实是 Borg 8.0（非常吃力）。FIT Profile 的原文是
+    "Common Borg CR10 / 0-10 RPE scale, multiplied 10x"。
+    """
+    stream = make_stream([sample_at(START, 0)], workout_rpe=80, workout_feel=25)
+    assert stream.workout_rpe == pytest.approx(8.0)
+    assert stream.workout_feel == 25
+
+    stream = make_stream([sample_at(START, 0)], workout_rpe=10, workout_feel=0)
+    assert stream.workout_rpe == pytest.approx(1.0)  # 10 表示 Borg 1.0，不是 10
+
+
+def test_workout_fields_absent_stays_none():
+    """没填就是 None，不要补 0——RPE 0 会被读成「一点也不累」。"""
+    stream = make_stream([sample_at(START, 0)])
+    assert stream.workout_rpe is None
+    assert stream.workout_feel is None
+
+
+def test_power_is_parsed_and_invalid_values_become_none():
+    """`power` 是 FIT record 的标准字段（字段号 7），与是否装功率计无关。
+
+    有功率计的导出会写满，没装的设备整列缺省。未测到的采样写 uint16 的
+    无效值 0xFFFF，必须读成 None 而不是 65535 瓦。
+    """
+    stream = make_stream(
+        [
+            sample_at(START, 0, power_w=180),
+            sample_at(START, 2, power_w=None),  # 0xFFFF
+            sample_at(START, 4, power_w=205),
+        ]
+    )
+    assert [s.power_w for s in stream.samples] == [180, None, 205]
+
+
+def test_power_summary_omitted_without_power_data():
+    """没功率就不出功率汇总，免得空值被当成 0 瓦。"""
+    samples = [FitSample(offset_s=i, hr=150) for i in range(5)]
+    summary = sample_summary(samples)
+    assert "power_avg_w" not in summary
+    assert "power_max_w" not in summary
+
+    powered = [FitSample(offset_s=i, hr=150, power_w=200 + i) for i in range(5)]
+    summary = sample_summary(powered)
+    # 功率峰值是有效指标（冲刺能力），不像速度会因 GPS 毛刺失真
+    assert summary["power_avg_w"] == 202.0
+    assert summary["power_max_w"] == 204
