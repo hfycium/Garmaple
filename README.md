@@ -18,7 +18,7 @@
 
 ```
 data/
-└── 605db530-..._1.zip
+└── <导出的数据包>.zip
     ├── DI_CONNECT/DI-Connect-Fitness/      # 活动摘要、个人最佳、训练计划
     ├── DI_CONNECT/DI-Connect-Wellness/     # 睡眠、生物指标、异常心率
     ├── DI_CONNECT/DI-Connect-Metrics/      # 训练历史、最大摄氧量、赛事预测
@@ -40,6 +40,16 @@ data/
 | `garmaple/` | 主代码 | 是 |
 | `tests/` | 测试与合成样本 | 是 |
 
+## 数据安全
+
+`data/` 全程被 `.gitignore` 排除。项目本身不含任何用户数据，也不会上传任何数据——所有解析都在本地完成。
+
+如果你要 fork 或参与开发，请用自己的导出包，**不要提交任何 `.fit` 文件或导出 zip**。运动轨迹包含精确的家庭住址与作息规律，泄露风险远高于一般个人数据。
+
 ## 状态
 
 仓库骨架阶段。解析、索引、查询能力待建设。
+
+## License
+
+[MIT](LICENSE)
