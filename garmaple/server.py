@@ -33,13 +33,19 @@ INSTRUCTIONS = """\
 
 def build_server(cfg: Config) -> Any:
     from mcp.server.mcpserver import MCPServer
+    # 工具里「预期内的失败」必须抛 ToolError，不能抛 ValueError / RuntimeError：
+    # 只有 ToolError 的文本会透给模型。其余异常被 SDK 当成 crash，模型只看到
+    # `Error executing tool <name>`，真实原因只进服务端日志——AI 既不知道错在哪，
+    # 也就无法改参数重试，只能原样再撞一次。
+    from mcp.server.mcpserver.exceptions import ToolError
 
     privacy = Privacy(cfg.privacy)
     mcp = MCPServer(name="garmaple", instructions=INSTRUCTIONS)
 
     def _store() -> Store:
         if not cfg.db_path.exists():
-            raise RuntimeError(
+            # 没建索引是预期内的情况，不是崩溃：把「去跑 index」这句话送到模型面前
+            raise ToolError(
                 "尚未建立索引。请先在终端运行 `garmaple index`，"
                 f"预期数据库位置：{cfg.db_path}"
             )
@@ -52,7 +58,9 @@ def build_server(cfg: Config) -> Any:
         try:
             return date.fromisoformat(raw).isoformat()
         except ValueError as exc:
-            raise ValueError(f"{field} 需为 YYYY-MM-DD 格式，收到 {raw!r}") from exc
+            raise ToolError(
+                f"{field} 需为 YYYY-MM-DD 格式，收到 {raw!r}"
+            ) from exc
 
     # ---------------- 工具 ----------------
 
@@ -143,9 +151,9 @@ def build_server(cfg: Config) -> Any:
         start = _date(start_date, "start_date")
         end = _date(end_date, "end_date")
         if start is None or end is None:
-            raise ValueError("start_date 与 end_date 均为必填")
+            raise ToolError("start_date 与 end_date 均为必填")
         if start > end:
-            raise ValueError("start_date 不能晚于 end_date")
+            raise ToolError("start_date 不能晚于 end_date")
 
         with _store() as store:
             rows = store.query_activities(start=start, end=end, sport=sport)
@@ -180,7 +188,7 @@ def build_server(cfg: Config) -> Any:
         start = _date(start_date, "start_date")
         end = _date(end_date, "end_date")
         if start and end and start > end:
-            raise ValueError("start_date 不能晚于 end_date")
+            raise ToolError("start_date 不能晚于 end_date")
 
         with _store() as store:
             if start is None and end is None:
