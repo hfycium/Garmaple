@@ -20,6 +20,7 @@ from datetime import datetime
 from .parser.activities import Activity
 from .parser.daily import DailyStat
 from .parser.sleep import SleepRecord
+from .parser.training import TrainingDay
 
 # 固定盐值：让伪 ID 在多次会话间保持稳定，又不直接暴露 activityId
 _ID_SALT = "garmaple-v1"
@@ -261,4 +262,35 @@ class Privacy:
             out["fell_asleep_at"] = self._moment(rec.start_at)
             out["woke_at"] = self._moment(rec.end_at)
         out["retro"] = rec.retro or None
+        return self._strip_none(out)
+
+    def training(self, rec: TrainingDay) -> dict[str, object]:
+        """单日训练状态。
+
+        状态与趋势都给中文标签，不只是翻译：`PRODUCTIVE` 与 `UNPRODUCTIVE`
+        只差一个前缀、`DETRAINING` 又容易被读成「正在训练」，模型按英文枚举
+        直接推结论会反向。标签让结论只有一种读法。
+
+        `updated_at` 不输出——它是设备同步快照的时刻，不是训练时刻，
+        对分析没有价值，只在同日去重时用过。
+        """
+        out: dict[str, object] = {
+            "date": rec.date,
+            "status": rec.status,
+            "status_label": rec.status_label,
+            "weekly_load": rec.weekly_load,
+            "load_position": rec.load_position,
+            "fitness_trend": rec.fitness_trend,
+            "fitness_trend_label": rec.fitness_trend_label,
+            "load_trend": rec.load_trend,
+            "load_trend_label": rec.load_trend_label,
+            "sport": rec.sport,
+        }
+        # 隧道边界缺失时整块不给，而不是给一个 {min: null, max: null}
+        if rec.tunnel_min is not None and rec.tunnel_max is not None:
+            out["load_tunnel"] = {"min": rec.tunnel_min, "max": rec.tunnel_max}
+
+        if self.allows_identity:
+            out["user_profile_id"] = rec.user_profile_id
+
         return self._strip_none(out)

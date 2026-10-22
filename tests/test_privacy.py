@@ -296,3 +296,64 @@ def test_sleep_drops_missing_fields() -> None:
     out = Privacy("strict").sleep(make_sleep_record(averageRespiration=None))
     assert "respiration_avg" not in out
     assert "deep_min" in out
+
+
+# ---------- 训练状态 ----------
+
+
+def make_training_record(**overrides: object):
+    from garmaple.parser.training import parse_training
+
+    from .test_training import make_block
+
+    rec = parse_training(make_block(**overrides))
+    assert rec is not None
+    return rec
+
+
+@pytest.mark.parametrize("level", ["strict", "normal", "raw"])
+def test_training_keeps_metrics_at_every_level(level: str) -> None:
+    out = Privacy(level).training(make_training_record())
+    assert out["date"] == "2025-04-23"
+    assert out["status"] == "PRODUCTIVE"
+    assert out["weekly_load"] == 453
+    assert out["load_position"] == "in"
+    assert out["load_tunnel"] == {"min": 281, "max": 640}
+
+
+def test_training_ships_chinese_labels() -> None:
+    """英文枚举容易被读反，标签跟着一起给，结论就只有一种读法。"""
+    out = Privacy("strict").training(make_training_record())
+    assert out["status_label"] == "有成效"
+    assert out["fitness_trend_label"] == "持平"
+    assert out["load_trend_label"] == "上升"
+
+
+def test_training_never_exposes_snapshot_time() -> None:
+    """快照时刻是设备同步时间，不是训练时间，任何档位都不输出。"""
+    for level in ("strict", "normal", "raw"):
+        out = Privacy(level).training(make_training_record())
+        assert "updated_at" not in out
+        assert "2025-04-22 16:01:57" not in str(out)
+
+
+def test_training_user_profile_only_in_raw() -> None:
+    assert "user_profile_id" not in Privacy("strict").training(make_training_record())
+    assert "user_profile_id" not in Privacy("normal").training(make_training_record())
+    assert Privacy("raw").training(make_training_record())["user_profile_id"] == 999
+
+
+def test_training_omits_tunnel_when_bounds_missing() -> None:
+    """边界缺失就整块不给，不留一个 min/max 都是 null 的空壳。"""
+    out = Privacy("strict").training(
+        make_training_record(loadTunnelMin=None, loadTunnelMax=None)
+    )
+    assert "load_tunnel" not in out
+    assert "load_position" not in out
+
+
+def test_training_keeps_zero_load() -> None:
+    """周负荷 0 必须出现，不能被当成缺失丢掉。"""
+    out = Privacy("strict").training(make_training_record(weeklyTrainingLoadSum=0))
+    assert out["weekly_load"] == 0
+    assert out["load_position"] == "below"
