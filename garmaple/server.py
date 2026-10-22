@@ -12,7 +12,7 @@ from typing import Any
 from .config import Config
 from .privacy import Privacy
 from .stats import human_duration, human_pace, summarize
-from .store import Store, row_to_activity, row_to_daily
+from .store import Store, row_to_activity, row_to_daily, row_to_sleep
 
 INSTRUCTIONS = """\
 本服务读取用户本地的佳明（Garmin）导出数据，不联网、不上传。
@@ -21,13 +21,18 @@ INSTRUCTIONS = """\
 因此默认不包含最近一次导出之后的活动。回答时若涉及时间范围，
 应说明数据截止日期。
 
-隐私：默认 strict 级别下不提供 GPS 坐标与地点名称，活动 ID 是伪 ID。
+隐私：默认 strict 级别下不提供 GPS 坐标、地点名称与作息时刻，活动 ID 是伪 ID。
 不要试图推测用户住址或作息规律。若用户需要更细的数据，请提示其
 自行调整 GARMAPLE_PRIVACY 配置，而不是尝试绕过限制。
 
-当前索引包含：活动摘要，以及每日 wellness 汇总（步数、静息心率、压力、
-身体电量、强度分钟）。尚未支持睡眠、训练负荷、逐秒采样等数据——
-被问到时直接说明当前版本没有这项能力，不要猜测数值。
+当前索引包含：活动摘要、每日 wellness 汇总（步数、静息心率、压力、
+身体电量、强度分钟）、睡眠（时长与分期）。
+
+两点必须注意：
+- 睡眠记录按**醒来日**归档。问「昨晚睡得怎么样」要查今天那条，
+  查昨天会拿到前一晚的数据。
+- 官方导出包里没有睡眠评分数值，也没有训练负荷（CTL/ATL/TSB）、
+  逐秒采样等数据。被问到时直接说明当前没有这项能力，不要猜测或估算数值。
 """
 
 
@@ -91,6 +96,15 @@ def build_server(cfg: Config) -> Any:
                     "days": day_count,
                     "date_from": dlo,
                     "date_to": dhi,
+                }
+            sleep_count = store.count_sleeps()
+            if sleep_count:
+                slo, shi = store.sleep_range()
+                result["sleep"] = {
+                    "nights": sleep_count,
+                    "date_from": slo,
+                    "date_to": shi,
+                    "note": "按醒来日归档；官方导出包不含睡眠评分",
                 }
             return result
 
@@ -220,8 +234,75 @@ def build_server(cfg: Config) -> Any:
                 result["note"] = f"区间内记录多于 {capped} 天，只返回最近 {capped} 天"
             return result
 
-    return mcp
+    @mcp.tool()
+    def get_sleep(
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: int = 14,
+    ) -> dict[str, Any]:
+        """查看每晚睡眠：时长、分期、呼吸率。
 
+        重要：记录按**醒来日**归档。用户问「昨晚睡得怎么样」要看**今天**这条，
+        查昨天会拿到前一晚的数据。这一点答错整段结论都会错位。
+
+        参数：
+            start_date / end_date: YYYY-MM-DD，含端点，均可省略；
+                两者都省略时返回最近 limit 晚
+            limit: 最多返回晚数，默认 14，上限 120；区间结果超长时只保留最近的部分
+
+        结果按日期正序。每晚的 status 说明可信度：
+            ok          有完整分期
+            off_wrist   当晚摘了手表，没有睡眠数据（不是「睡了 0 分钟」）
+            no_stages   确认了睡眠窗但设备没记分期
+            unconfirmed 睡眠窗未确认
+
+        非 ok 的夜晚只有 date 与 status，不带时长：那些「睡眠窗」分别是
+        摘下到戴上的间隔、或固定占位值，当成睡眠时长会被读成睡了十几小时。
+        官方导出包里没有睡眠评分数值，被问到时直接说明没有，不要估算。
+        """
+        capped = max(1, min(int(limit or 14), 120))
+        start = _date(start_date, "start_date")
+        end = _date(end_date, "end_date")
+        if start and end and start > end:
+            raise ToolError("start_date 不能晚于 end_date")
+
+        with _store() as store:
+            if start is None and end is None:
+                rows = store.query_sleeps(limit=capped, order="desc")
+                truncated = False
+            else:
+                rows = store.query_sleeps(start=start, end=end, order="asc")
+                truncated = len(rows) > capped
+                if truncated:
+                    rows = rows[-capped:]
+
+            nights = [privacy.sleep(row_to_sleep(r)) for r in rows]
+            if not nights:
+                return {
+                    "count": 0,
+                    "nights": [],
+                    "hint": "该区间没有睡眠记录。可用 get_data_overview 确认覆盖范围；"
+                            "若索引早于本次升级，请重新运行 garmaple index。",
+                }
+
+            result: dict[str, Any] = {
+                "count": len(nights),
+                "range": {"from": nights[0]["date"], "to": nights[-1]["date"]},
+                "nights": nights,
+            }
+            missing = {n["status"] for n in nights if n.get("status") != "ok"}
+            if missing:
+                result["status_note"] = (
+                    "这些晚没有有效睡眠数据，原因见 status："
+                    "off_wrist=摘表，no_stages=设备未记分期，unconfirmed=睡眠窗未确认。"
+                    "它们都不是「睡了 0 分钟」。"
+                )
+            if truncated:
+                result["truncated"] = True
+                result["note"] = f"区间内记录多于 {capped} 晚，只返回最近 {capped} 晚"
+            return result
+
+    return mcp
 
 def run(cfg: Config) -> int:
     """以 stdio 传输启动服务，供 MCP 客户端拉起。"""

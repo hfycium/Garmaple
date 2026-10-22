@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import zipfile
+from datetime import date, timedelta
 from pathlib import Path
 
 from garmaple.cli import main
@@ -17,6 +18,16 @@ from garmaple.store import Store
 from .test_activities import make_raw
 from .test_daily import make_block
 from .test_sleep import make_sleep
+
+
+def sleep_block(wake_day: str) -> dict[str, object]:
+    """醒来日为 wake_day 的一晚：前一晚 23:20 入睡，当日 10:21 起床（本地 +8）。"""
+    prev = (date.fromisoformat(wake_day) - timedelta(days=1)).isoformat()
+    return make_sleep(
+        calendarDate=wake_day,
+        sleepStartTimestampGMT=f"{prev}T15:20:00.0",
+        sleepEndTimestampGMT=f"{wake_day}T02:21:00.0",
+    )
 
 
 def build_archive(root: Path, activities: int = 2, days: int = 2, sleeps: int | None = None) -> Path:
@@ -34,7 +45,7 @@ def build_archive(root: Path, activities: int = 2, days: int = 2, sleeps: int | 
     ]
     sleep_count = days if sleeps is None else sleeps
     sleep = [
-        make_sleep(calendarDate=f"2026-07-{20 + i:02d}") for i in range(sleep_count)
+        sleep_block(f"2026-07-{20 + i:02d}") for i in range(sleep_count)
     ]
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr(
