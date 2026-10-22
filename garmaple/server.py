@@ -11,14 +11,17 @@ from datetime import date
 from typing import Any
 
 from .config import Config
+from .parser.metrics import RACE_DISTANCES_KM
 from .privacy import Privacy
 from .stats import human_duration, human_pace, summarize
 from .store import (
     Store,
     row_to_activity,
     row_to_daily,
+    row_to_race,
     row_to_sleep,
     row_to_training,
+    row_to_vo2max,
 )
 
 INSTRUCTIONS = """\
@@ -34,16 +37,42 @@ INSTRUCTIONS = """\
 
 当前索引包含：活动摘要、每日 wellness 汇总（步数、静息心率、压力、
 身体电量、强度分钟）、睡眠（时长与分期）、训练状态（状态判定、
-周训练负荷、负荷隧道）。
+周训练负荷、负荷隧道）、比赛成绩预测（5K / 10K / 半马 / 全马）、
+最大摄氧量。
 
-两点必须注意：
+四点必须注意：
 - 睡眠记录按**醒来日**归档。问「昨晚睡得怎么样」要查今天那条，
   查昨天会拿到前一晚的数据。
 - 官方导出包里没有睡眠评分数值，也没有 CTL / ATL / TSB 三个体能指标，
   也没有逐秒采样。训练状态与周训练负荷是设备自己判定的结果，
   与 Connect 上显示的一致，但不要把它当成 CTL 用，也不要自行换算。
   被问到时直接说明当前没有这项能力，不要猜测或估算数值。
+- 比赛预测是设备按当前体能**推算**的完赛时间，不是已经跑出来的成绩，
+  两者不要混着说。
+- 最大摄氧量只在设备测出有效数据的日子才有记录，日期很稀疏，
+  不要按天插值，也不要把缺记录说成数值下降。
 """
+
+
+def _prediction_change(
+    first: dict[str, Any], last: dict[str, Any]
+) -> dict[str, Any]:
+    """两次预测的差值：正数表示变快。
+
+    只给「变快为正」这一个方向。跑步里说的进步是时间变短，如果输出带符号的
+    原始差值，模型很容易把负数读成退步、把「变快 40 秒」说成「慢了 40 秒」。
+    """
+    out: dict[str, Any] = {}
+    for key in RACE_DISTANCES_KM:
+        a = first.get("predicted", {}).get(key, {}).get("seconds")
+        b = last.get("predicted", {}).get(key, {}).get("seconds")
+        if a is None or b is None or a <= 0:
+            continue
+        out[key] = {
+            "faster_by_s": a - b,
+            "change_pct": round((a - b) / a * 100, 2),
+        }
+    return out
 
 
 def build_server(cfg: Config) -> Any:
@@ -124,6 +153,24 @@ def build_server(cfg: Config) -> Any:
                     "date_from": tlo,
                     "date_to": thi,
                     "note": "设备判定的结果；不含 CTL / ATL / TSB",
+                }
+            race_count = store.count_race_predictions()
+            if race_count:
+                rlo, rhi = store.race_range()
+                result["race_predictions"] = {
+                    "days": race_count,
+                    "date_from": rlo,
+                    "date_to": rhi,
+                    "note": "设备推算的完赛时间，不是已完成的比赛成绩",
+                }
+            vo2_count = store.count_vo2max()
+            if vo2_count:
+                vlo, vhi = store.vo2max_range()
+                result["vo2max"] = {
+                    "days": vo2_count,
+                    "date_from": vlo,
+                    "date_to": vhi,
+                    "note": "只在测出有效数据的日子有记录，日期稀疏",
                 }
             return result
 
@@ -399,6 +446,165 @@ def build_server(cfg: Config) -> Any:
             if truncated:
                 result["truncated"] = True
                 result["note"] = f"区间内记录多于 {capped} 天，只返回最近 {capped} 天"
+            return result
+
+    @mcp.tool()
+    def get_race_predictions(
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: int = 31,
+    ) -> dict[str, Any]:
+        """查看设备推算的比赛成绩预测：5K / 10K / 半马 / 全马的预计完赛时间。
+
+        这是手表按当前体能**推算**出来的成绩，**不是已经跑出来的比赛成绩**，
+        两者不要混着说。它也不能当 CTL / 体能值用——那是另外一套指标，
+        归档里没有。
+
+        想看体能走向时用它比看训练状态更直接：预测时间在变短就是体能变好。
+        与 `get_training_status` 的 `weekly_load` 是两套不同的东西，
+        后者是负荷，前者是能力。
+
+        参数：
+            start_date / end_date: YYYY-MM-DD，含端点，均可省略；
+                两者都省略时返回最近 limit 天
+            limit: 最多返回天数，默认 31，上限 120；区间结果超长时只保留最近的部分
+
+        结果按日期正序：
+            latest   最后一天那条，带可读时间与预测配速，回答「我 5K 能跑多少」直接用它
+            days     趋势数组，每个距离**只给秒数**（键名 5k / 10k / half / marathon），
+                     便于做比较，也免得 120 天 × 4 距离的格式化文本把上下文撑满
+            change   对比本次返回的首末两天：
+                     faster_by_s  为正表示变快（时间变短），不是原始差值
+                     change_pct   变化百分比，同样正数表示变快
+
+        缺某个距离时该键直接不出现，不是 0。
+        """
+        capped = max(1, min(int(limit or 31), 120))
+        start = _date(start_date, "start_date")
+        end = _date(end_date, "end_date")
+        if start and end and start > end:
+            raise ToolError("start_date 不能晚于 end_date")
+
+        with _store() as store:
+            if start is None and end is None:
+                rows = store.query_race_predictions(limit=capped, order="desc")
+                truncated = False
+            else:
+                rows = store.query_race_predictions(start=start, end=end, order="asc")
+                truncated = len(rows) > capped
+                if truncated:
+                    rows = rows[-capped:]
+
+            days = [privacy.prediction(row_to_race(r)) for r in rows]
+            if not days:
+                return {
+                    "count": 0,
+                    "days": [],
+                    "hint": "该区间没有比赛预测。可用 get_data_overview 确认覆盖范围；"
+                            "若索引早于本次升级，请重新运行 garmaple index。",
+                }
+
+            # 趋势数组只留秒数：可读时间与配速由 latest 承担，否则 120 天 × 4 距离
+            # × 3 个字段能到 40KB，白白吃掉上下文。
+            series = [
+                {"date": d["date"], **{
+                    k: v["seconds"] for k, v in d["predicted"].items()
+                }}
+                for d in days
+            ]
+
+            result: dict[str, Any] = {
+                "count": len(days),
+                "range": {"from": days[0]["date"], "to": days[-1]["date"]},
+                "latest": days[-1],
+                "days": series,
+            }
+            if len(days) > 1:
+                change = _prediction_change(days[0], days[-1])
+                if change:
+                    result["change"] = change
+                    result["change_note"] = (
+                        "faster_by_s 为正表示预测变快（时间变短）；"
+                        "对比的是本次返回区间的首末两天"
+                    )
+            if truncated:
+                result["truncated"] = True
+                result["note"] = f"区间内记录多于 {capped} 天，只返回最近 {capped} 天"
+            return result
+
+    @mcp.tool()
+    def get_vo2max_trend(
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: int = 120,
+    ) -> dict[str, Any]:
+        """查看最大摄氧量（VO2max）的历次测量与变化。
+
+        重要：**只有设备测出有效数据的日子才有记录**，日期天然稀疏
+        （可能是隔几天一条，也可能隔几周）。中间的空缺不是「数值下降」，
+        也不能按天插值补点——补出来的曲线是编的。
+
+        返回：
+            samples  按日期正序的每次测量：date / vo2max / sport
+            latest   最后一次测量，回答「我现在多少」用它
+            range    最小值、最大值及其日期
+            change   首末差值（正数表示提高）
+
+        参数：
+            start_date / end_date: YYYY-MM-DD，含端点，均可省略
+            limit: 最多返回条数，默认 120（实测全年也不到 100 条，等于全给）。
+                给日期时结果超长只保留最近的部分并置 truncated
+
+        归档里没有「体能年龄」的可用数值——设备写的是固定占位值，
+        因此本工具不提它。被问到体能年龄时说明没有这项数据。
+        """
+        capped = max(1, min(int(limit or 120), 120))
+        start = _date(start_date, "start_date")
+        end = _date(end_date, "end_date")
+        if start and end and start > end:
+            raise ToolError("start_date 不能晚于 end_date")
+
+        with _store() as store:
+            if start is None and end is None:
+                rows = store.query_vo2max(limit=capped, order="desc")
+                truncated = False
+            else:
+                rows = store.query_vo2max(start=start, end=end, order="asc")
+                truncated = len(rows) > capped
+                if truncated:
+                    rows = rows[-capped:]
+
+            samples = [privacy.vo2max(row_to_vo2max(r)) for r in rows]
+            if not samples:
+                return {
+                    "count": 0,
+                    "samples": [],
+                    "hint": "该区间没有最大摄氧量记录。可用 get_data_overview 确认覆盖范围；"
+                            "若索引早于本次升级，请重新运行 garmaple index。",
+                }
+
+            values = [(s["date"], s["vo2max"]) for s in samples]
+            lowest = min(values, key=lambda p: p[1])
+            highest = max(values, key=lambda p: p[1])
+
+            result: dict[str, Any] = {
+                "count": len(samples),
+                "range": {"from": samples[0]["date"], "to": samples[-1]["date"]},
+                "latest": samples[-1],
+                "lowest": {"date": lowest[0], "vo2max": lowest[1]},
+                "highest": {"date": highest[0], "vo2max": highest[1]},
+                "samples": samples,
+                "sparsity_note": "记录只出现在设备测出有效数据的日子，"
+                                 "样本间的空缺不代表数值下降",
+            }
+            if len(samples) > 1:
+                result["change"] = {
+                    "delta": round(samples[-1]["vo2max"] - samples[0]["vo2max"], 1),
+                    "note": "正数表示提高；对比的是本次返回区间的首末两次测量",
+                }
+            if truncated:
+                result["truncated"] = True
+                result["note"] = f"区间内记录多于 {capped} 条，只返回最近 {capped} 条"
             return result
 
     return mcp

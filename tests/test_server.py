@@ -44,7 +44,9 @@ def test_daily_summary_tool_is_registered(tmp_path: Path) -> None:
     names = tool_names(prepared(tmp_path))
     assert "get_daily_summary" in names
     assert "get_training_status" in names
-    assert len(names) == 7
+    assert "get_race_predictions" in names
+    assert "get_vo2max_trend" in names
+    assert len(names) == 9
 
 
 def test_daily_summary_defaults_to_recent_days_in_order(tmp_path: Path) -> None:
@@ -325,6 +327,143 @@ def test_overview_reports_training_coverage(tmp_path: Path) -> None:
     assert "CTL" in out["training_status"]["note"]
 
 
+# ---------------- get_race_predictions ----------------
+
+def test_race_predictions_returns_days_in_order(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_race_predictions", {})
+    assert out["count"] == 3
+    assert [d["date"] for d in out["days"]] == [
+        "2026-07-20", "2026-07-21", "2026-07-22",
+    ]
+
+
+def test_race_predictions_latest_is_the_last_day(tmp_path: Path) -> None:
+    """latest 与 days 的末项指同一天，但 latest 带格式化信息。"""
+    out = call(prepared(tmp_path), "get_race_predictions", {})
+    assert out["latest"]["date"] == out["days"][-1]["date"]
+    assert out["latest"]["predicted"]["5k"]["seconds"] == out["days"][-1]["5k"]
+
+
+def test_race_predictions_merge_same_day_snapshots(tmp_path: Path) -> None:
+    """同一天两条预测只出一天，取时间更晚那条（1086 而非 1092）。"""
+    out = call(prepared(tmp_path), "get_race_predictions", {})
+    assert out["count"] == 3
+    assert {d["5k"] for d in out["days"]} == {1086}
+
+
+def test_race_predictions_trend_gives_seconds_only(tmp_path: Path) -> None:
+    """趋势数组只给秒数：120 天 × 4 距离都带格式化文本会把上下文撑满。"""
+    out = call(prepared(tmp_path), "get_race_predictions", {"limit": 1})
+    assert out["days"][0] == {
+        "date": "2026-07-22", "5k": 1086, "10k": 2233, "half": 6540, "marathon": 14040,
+    }
+
+
+def test_race_predictions_latest_gives_time_and_pace(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_race_predictions", {"limit": 1})
+    five = out["latest"]["predicted"]["5k"]
+    assert five["time"] == "18m06s"
+    assert five["pace"] == "3'37\"/km"
+
+
+def test_race_predictions_have_no_change_for_single_day(tmp_path: Path) -> None:
+    """只有一天时没有「变化」可言，不要凭空给 0。"""
+    out = call(prepared(tmp_path), "get_race_predictions", {"limit": 1})
+    assert "change" not in out
+
+
+def test_race_predictions_change_is_positive_when_faster(tmp_path: Path) -> None:
+    """同值的数据变化为 0——这里只锁住字段形状与「正数=变快」的方向。"""
+    out = call(prepared(tmp_path), "get_race_predictions", {})
+    change = out["change"]["5k"]
+    assert change["faster_by_s"] == 0
+    assert change["change_pct"] == 0
+    assert "正表示预测变快" in out["change_note"]
+
+
+def test_race_predictions_truncate_to_most_recent(tmp_path: Path) -> None:
+    out = call(
+        prepared(tmp_path), "get_race_predictions",
+        {"start_date": "2026-07-20", "end_date": "2026-07-22", "limit": 2},
+    )
+    assert out["truncated"] is True
+    assert [d["date"] for d in out["days"]] == ["2026-07-21", "2026-07-22"]
+
+
+def test_race_predictions_empty_range_gives_hint(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_race_predictions", {"start_date": "2099-01-01"})
+    assert out["count"] == 0
+    assert "get_data_overview" in out["hint"]
+
+
+def test_race_predictions_are_privacy_filtered(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_race_predictions", {})
+    text = json.dumps(out, ensure_ascii=False)
+    assert "user_profile_id" not in text
+
+
+def test_race_predictions_raw_exposes_user_profile(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path, privacy="raw"), "get_race_predictions", {"limit": 1})
+    assert out["latest"]["user_profile_id"] == 999
+
+
+def test_overview_reports_race_coverage(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_data_overview")
+    assert out["race_predictions"]["days"] == 3
+    assert "不是已完成的比赛成绩" in out["race_predictions"]["note"]
+
+
+# ---------------- get_vo2max_trend ----------------
+
+def test_vo2max_returns_samples_in_order(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_vo2max_trend", {})
+    assert out["count"] == 3
+    assert [s["date"] for s in out["samples"]] == [
+        "2026-07-20", "2026-07-21", "2026-07-22",
+    ]
+    assert out["samples"][0]["vo2max"] == 62.0
+
+
+def test_vo2max_gives_lowest_and_highest(tmp_path: Path) -> None:
+    """样本全同值时最低与最高都指向同一次，不能报成缺失。"""
+    out = call(prepared(tmp_path), "get_vo2max_trend", {})
+    assert out["lowest"]["vo2max"] == 62.0
+    assert out["highest"]["vo2max"] == 62.0
+
+
+def test_vo2max_reports_change_between_first_and_last(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_vo2max_trend", {})
+    assert out["change"]["delta"] == 0
+    assert "正数表示提高" in out["change"]["note"]
+
+
+def test_vo2max_warns_about_sparse_dates(tmp_path: Path) -> None:
+    """样本天然稀疏，必须明说空缺不等于数值下降。"""
+    out = call(prepared(tmp_path), "get_vo2max_trend", {})
+    assert "不代表数值下降" in out["sparsity_note"]
+
+
+def test_vo2max_never_mentions_fitness_age(tmp_path: Path) -> None:
+    """归档里 fitnessAge 恒为占位值 "20"，任何档位都不该出现在输出里。"""
+    base = prepared(tmp_path)
+    for level in ("strict", "normal", "raw"):
+        cfg = Config(data_dir=base.data_dir, cache_dir=base.cache_dir, privacy=level)
+        out = call(cfg, "get_vo2max_trend", {})
+        assert "fitness_age" not in json.dumps(out, ensure_ascii=False)
+
+
+def test_vo2max_empty_range_gives_hint(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_vo2max_trend", {"start_date": "2099-01-01"})
+    assert out["count"] == 0
+    assert "get_data_overview" in out["hint"]
+
+
+def test_overview_reports_vo2max_coverage(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_data_overview")
+    assert out["vo2max"]["days"] == 3
+    assert "稀疏" in out["vo2max"]["note"]
+
+
 # ---------- 预期内失败：必须让模型看见原因 ----------
 #
 # 为什么这几条要单独测：SDK 只把 ToolError 的文本透给模型；其他异常被当成
@@ -341,6 +480,10 @@ def test_expected_failures_are_not_wrapped_as_crash(tmp_path: Path) -> None:
         ("get_period_summary", {"start_date": "2026-07-22", "end_date": "2026-07-20"}),
         ("get_training_status", {"start_date": "2026-07-22", "end_date": "2026-07-20"}),
         ("get_training_status", {"start_date": "2026-13-01"}),
+        ("get_race_predictions", {"start_date": "2026-07-22", "end_date": "2026-07-20"}),
+        ("get_race_predictions", {"start_date": "2026/07/20"}),
+        ("get_vo2max_trend", {"start_date": "2026-07-22", "end_date": "2026-07-20"}),
+        ("get_vo2max_trend", {"end_date": "not-a-date"}),
     ]
     for name, args in cases:
         with pytest.raises(ToolError) as excinfo:
