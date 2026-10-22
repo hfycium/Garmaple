@@ -264,3 +264,46 @@ def test_dedupe_keeps_last_and_sorts() -> None:
     out = dedupe(days)
     assert [d.date for d in out] == ["2026-07-24", "2026-07-25"]
     assert out[1].steps == 3  # 后写入的覆盖先写入的
+
+
+# ---------- 时区元数据异常的天 ----------
+
+
+def test_offset_reliability() -> None:
+    from garmaple.parser.daily import offset_is_reliable
+
+    assert offset_is_reliable(make_block())
+    # 恰好 0 是可信的（用户就在 UTC）
+    assert offset_is_reliable(make_block(wellnessStartTimeGmt=LOCAL_START))
+    # 非零但只有 -1 分钟：设备没写入时区
+    assert not offset_is_reliable(
+        make_block(
+            wellnessStartTimeGmt="2026-07-24T00:01:00.0",
+            wellnessStartTimeLocal="2026-07-24T00:00:00.0",
+        )
+    )
+    assert not offset_is_reliable({})
+
+
+def test_days_borrow_shard_offset_when_metadata_broken() -> None:
+    """回归：最早 4 天的偏移是 -1 分钟，若按它自己算会整体差一个时区。"""
+    broken = make_block(
+        calendarDate="2026-07-23",
+        wellnessStartTimeGmt="2026-07-23T00:01:00.0",
+        wellnessStartTimeLocal="2026-07-23T00:00:00.0",
+    )
+    days = parse_days([make_block(), broken])
+    by_date = {d.date: d for d in days}
+    # 坏掉的那天借用同分片的 +8，而不是按 0 输出
+    assert by_date["2026-07-23"].bb_high_at == datetime(2026, 7, 24, 10, 57)
+    assert by_date["2026-07-24"].bb_high_at == datetime(2026, 7, 24, 10, 57)
+
+
+def test_parse_daily_without_fallback_uses_local_metadata() -> None:
+    broken = make_block(
+        wellnessStartTimeGmt="2026-07-24T00:01:00.0",
+        wellnessStartTimeLocal="2026-07-24T00:00:00.0",
+    )
+    d = parse_daily(broken)
+    assert d is not None
+    assert d.bb_high_at == datetime(2026, 7, 24, 2, 57)  # 偏移按 0 处理
