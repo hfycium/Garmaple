@@ -111,10 +111,14 @@ def parse_activity(raw: dict[str, Any]) -> Activity | None:
     if aid is None:
         return None
 
+    # hrTimeInZone_* 是**毫秒**。实测 305 个活动，七个区间合计 ÷ duration_s
+    # 恒等于 1000.00（误差来自四舍五入），没有例外。
+    # 这里存秒：区间要算的只有占比，毫秒级份额显示不出差别，留着反而会让
+    # 「一次 55 分钟的跑，Z2 有 29000」这种数字看着像异常。
     zones: list[int] = []
     for i in range(7):
         v = _num(raw.get(f"hrTimeInZone_{i}"))
-        zones.append(int(v) if v is not None else 0)
+        zones.append(int(round(v / MS_PER_S)) if v is not None else 0)
 
     speed = _num(raw.get("avgSpeed"))
 

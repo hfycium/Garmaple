@@ -157,8 +157,27 @@ def test_schema_version_recorded(store: Store) -> None:
     assert store.get_meta("schema_version") == str(SCHEMA_VERSION)
 
 
-def test_reopening_old_schema_rebuilds(tmp_path: Path) -> None:
-    """结构完整时，仅有版本号不一致不应丢弃已索引的数据。"""
+def test_reopening_same_version_keeps_data(tmp_path: Path) -> None:
+    """版本一致时必须原样保留——否则每次启动都清库。
+
+    这条是版本重建策略的安全网：判据写错方向，代价是用户数据每次都丢。
+    """
+    path = tmp_path / "same.sqlite3"
+    with Store(path) as s:
+        s.upsert_activities([act(1)], source="x")
+
+    with Store(path) as s:
+        assert s.count_activities() == 1
+
+
+def test_reopening_old_version_rebuilds(tmp_path: Path) -> None:
+    """版本号不一致就丢弃旧表，即使列结构完全正确。
+
+    早先的策略是「只看列结构、不信版本号」，理由是版本号曾被提前写入导致
+    表修不好。但列结构没变、**列里存的东西变了**时（hr_zone_* 从毫秒改存秒
+    就是这样），列结构检查永远发现不了，只会把旧单位当新单位读。
+    因此两条判据都要：列结构治「表错」，版本号治「值错」。
+    """
     from garmaple.store import SCHEMA_VERSION
 
     path = tmp_path / "old.sqlite3"
@@ -168,7 +187,7 @@ def test_reopening_old_schema_rebuilds(tmp_path: Path) -> None:
     s.close()
 
     s2 = Store(path)  # 触发版本检查
-    assert s2.count_activities() == 1  # 结构没问题，数据保留
+    assert s2.count_activities() == 0  # 旧单位的数据不可信，整表丢弃
     assert s2.get_meta("schema_version") == str(SCHEMA_VERSION)  # 版本号被推进
     s2.close()
 

@@ -24,7 +24,7 @@ from .parser.sleep import STATUS_OK, SleepRecord
 from .parser.training import TrainingDay
 from .privacy import pseudo_activity_id
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _META_SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -595,10 +595,22 @@ class Store:
     def _migrate(self) -> None:
         """索引随时可从 data/ 重建，因此结构不符时直接丢弃旧表，不做增量迁移。
 
-        判据故意用「实际列结构」而不是 meta 里的版本号：版本号可能被中途写入，
-        一旦元数据写着新版本而表仍是旧的，只查版本号就永远修不好
-        （曾因此出现 `no such column: pseudo_id`）。
+        判据有两条，缺一不可：
+
+        1. **实际列结构**（`PRAGMA table_info`）。版本号可能被中途写入，一旦
+           元数据写着新版本而表仍是旧的，只查版本号就永远修不好
+           （曾因此出现 `no such column: pseudo_id`）。
+        2. **版本号本身**。列结构没变但「列里存的东西」变了时，只有版本号能
+           发现：hr_zone_* 从毫秒改存秒就是这种情况，改名、改列都没发生，
+           不按版本号重建就会继续把旧单位当成新单位读。
+
+        丢弃后需要重新跑 `garmaple index`——工具输出里的 hint 会提示这一点。
         """
+        stored = self.get_meta("schema_version")
+        if stored is not None and stored != str(SCHEMA_VERSION):
+            for table in self._REQUIRED_COLUMNS:
+                self._conn.execute(f"DROP TABLE IF EXISTS {table}")
+
         for table, required in self._REQUIRED_COLUMNS.items():
             exists = self._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)

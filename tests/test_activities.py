@@ -42,8 +42,8 @@ def make_raw(**overrides: object) -> dict[str, object]:
         "avgStrideLength": 105.5,
         "avgRunCadence": 178.0,
         "lapCount": 10,
-        "hrTimeInZone_3": 1800,
-        "hrTimeInZone_4": 900,
+        "hrTimeInZone_3": 1_800_000,  # ms -> 1800 s
+        "hrTimeInZone_4": 900_000,    # ms -> 900 s
         "locationName": "某市",
         "startLatitude": 30.0,
         "startLongitude": 120.0,
@@ -100,6 +100,25 @@ def test_local_start_is_wall_clock_time() -> None:
     assert act is not None and act.utc_start and act.local_start
     # 本地时间比 UTC 晚 8 小时，钟面时间应体现这一点
     assert (act.local_start - act.utc_start).total_seconds() == pytest.approx(8 * 3600)
+
+
+def test_hr_zones_are_converted_from_milliseconds() -> None:
+    """区间原始值是毫秒，必须换成秒。
+
+    搞错的后果不是数字偏大 1000 倍那么直观——一次 55 分钟的跑会显示
+    「Z2 有 29000」，看着像另一项指标，而不是明显的单位错误。
+    """
+    act = parse_activity(make_raw())
+    assert act is not None
+    assert act.hr_zone_seconds[3] == 1800
+    assert act.hr_zone_seconds[4] == 900
+
+
+def test_hr_zone_total_matches_duration() -> None:
+    """七个区间合计应落在活动时长附近——这是判断单位对不对的方法。"""
+    act = parse_activity(make_raw())
+    assert act is not None and act.duration_s is not None
+    assert sum(act.hr_zone_seconds) == pytest.approx(act.duration_s, rel=0.5)
 
 
 def test_missing_fields_do_not_crash() -> None:
