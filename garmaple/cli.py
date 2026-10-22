@@ -1,0 +1,190 @@
+"""命令行入口。
+
+    garmaple index    解析导出包，建立本地索引
+    garmaple doctor   自检：数据、索引、隐私配置
+    garmaple serve    启动 MCP 服务（stdio）
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+from . import __version__
+from .archive import ArchiveError, discover
+from .config import Config, ConfigError
+from .parser.activities import parse_activities
+from .store import Store
+
+ACTIVITY_GLOB = "*summarizedActivities.json"
+
+
+def _force_utf8() -> None:
+    """Windows 终端默认编码未必是 UTF-8，中文输出会炸。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
+
+
+def _hr(title: str) -> None:
+    print(f"\n{title}")
+    print("-" * max(12, len(title)))
+
+
+def cmd_index(cfg: Config) -> int:
+    data_dir = cfg.require_data()
+    try:
+        dataset = discover(data_dir)
+    except ArchiveError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+
+    with dataset:
+        print(f"数据目录   {data_dir}")
+        print(f"发现归档   {len(dataset)} 个")
+
+        shards = dataset.find_all(ACTIVITY_GLOB)
+        if not shards:
+            print("错误：归档中没有活动摘要文件（*summarizedActivities.json）", file=sys.stderr)
+            return 1
+
+        activities = []
+        for archive, name in shards:
+            parsed = parse_activities(archive.read_json(name))
+            activities.extend(parsed)
+            print(f"  {name.rsplit('/', 1)[-1]:<44} {len(parsed):>5} 条")
+
+        if not activities:
+            print("错误：解析结果为空", file=sys.stderr)
+            return 1
+
+        # 去重：多次导出可能包含同一活动
+        unique = {a.activity_id: a for a in activities}
+        deduped = sorted(unique.values(), key=lambda a: a.activity_id)
+
+        dates = sorted(a.utc_start for a in deduped if a.utc_start)
+        sports = Counter(a.sport for a in deduped)
+
+        _hr("概览")
+        print(f"活动总数   {len(deduped)} 条" + (
+            f"（原始 {len(activities)} 条，去重 {len(activities) - len(deduped)} 条）"
+            if len(activities) != len(deduped) else ""
+        ))
+        if dates:
+            print(f"时间跨度   {dates[0].date()} → {dates[-1].date()}")
+        print("运动类型   " + ", ".join(f"{k} {v}" for k, v in sports.most_common(8)))
+
+        with Store(cfg.db_path) as store:
+            store.upsert_activities(deduped, source=dataset.archives[0].label)
+            store.set_meta("indexed_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+            store.set_meta("source", dataset.archives[0].label)
+            total = store.count_activities()
+
+        _hr("索引")
+        print(f"写入位置   {cfg.db_path}")
+        print(f"库内活动   {total} 条")
+
+    print(f"\n完成。隐私级别 {cfg.privacy}（strict 下坐标与地点不会进入 AI 上下文）")
+    return 0
+
+
+def cmd_doctor(cfg: Config) -> int:
+    ok = True
+    print(f"garmaple {__version__}")
+
+    _hr("配置")
+    print(f"数据目录   {cfg.data_dir}  {'✓' if cfg.data_dir.exists() else '✗ 不存在'}")
+    print(f"缓存目录   {cfg.cache_dir}")
+    print(f"隐私级别   {cfg.privacy}")
+    ok &= cfg.data_dir.exists()
+
+    _hr("数据")
+    try:
+        with discover(cfg.data_dir) as dataset:
+            print(f"导出包     {len(dataset)} 个")
+            shards = dataset.find_all(ACTIVITY_GLOB)
+            print(f"活动分片   {len(shards)} 个")
+            fits = dataset.find_one("UploadedFiles_*.zip")
+            if fits:
+                with fits[0].nested(fits[1]) as nested:
+                    n = len([x for x in nested.names if x.lower().endswith(".fit")])
+                print(f"原始 FIT   {n} 个")
+            ok &= bool(shards)
+    except ArchiveError as exc:
+        print(f"错误：{exc}")
+        ok = False
+
+    _hr("索引")
+    if cfg.db_path.exists():
+        with Store(cfg.db_path) as store:
+            n = store.count_activities()
+            lo, hi = store.date_range()
+            print(f"活动       {n} 条")
+            print(f"日期范围   {lo} → {hi}")
+            print(f"上次索引   {store.get_meta('indexed_at') or '未知'}")
+            ok &= n > 0
+    else:
+        print("尚未建立索引，请先运行 garmaple index")
+        ok = False
+
+    print("\n" + ("一切就绪。" if ok else "存在问题，见上。"))
+    return 0 if ok else 1
+
+
+def cmd_serve(cfg: Config) -> int:
+    try:
+        from .server import run
+    except ImportError as exc:
+        print(f"无法加载 MCP 服务：{exc}", file=sys.stderr)
+        return 1
+    return run(cfg)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="garmaple",
+        description="读取佳明官方导出归档，在本地建立索引并通过 MCP 提供给 AI。",
+    )
+    p.add_argument("--version", action="version", version=f"garmaple {__version__}")
+    p.add_argument("--data", help="导出包所在目录（默认 ./data，或环境变量 GARMAPLE_DATA）")
+    p.add_argument("--cache", help="索引与缓存目录（默认 ./cache，或 GARMAPLE_CACHE）")
+    p.add_argument(
+        "--privacy",
+        choices=["strict", "normal", "raw"],
+        help="隐私级别（默认 strict，或 GARMAPLE_PRIVACY）",
+    )
+
+    sub = p.add_subparsers(dest="command")
+    sub.add_parser("index", help="解析导出包并建立本地索引")
+    sub.add_parser("doctor", help="自检数据、索引与隐私配置")
+    sub.add_parser("serve", help="启动 MCP 服务（stdio）")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    _force_utf8()
+    args = build_parser().parse_args(argv)
+
+    try:
+        cfg = Config.load(data_dir=args.data, cache_dir=args.cache, privacy=args.privacy)
+    except ConfigError as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return 2
+
+    command = args.command or "doctor"
+    if command == "index":
+        return cmd_index(cfg)
+    if command == "doctor":
+        return cmd_doctor(cfg)
+    if command == "serve":
+        return cmd_serve(cfg)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
