@@ -71,14 +71,20 @@ Garmaple 不是实时工具，数据新鲜度取决于你上次导出的时间�
 - [ ] `get_hr_zones` — 心率区间分布与时间占比
 - [ ] `get_pace_hr_drift` — 配速心率漂移（有氧解耦）
 - [ ] `get_personal_records` — 个人最佳（5K / 10K / 半马 / 全马）
-- [ ] `get_race_predictions` — 赛事成绩预测趋势
-- [ ] `get_vo2max_trend` — 最大摄氧量变化
+- [x] `get_race_predictions` — 比赛成绩预测趋势（5K / 10K / 半马 / 全马）
+- [x] `get_vo2max_trend` — 最大摄氧量变化
 - [ ] `get_recovery_correlation` — 睡眠 / 压力 / 身体电量与训练表现的相关性
 - [ ] `get_gear_mileage` — 跑鞋装备里程预警
 
 > `get_training_load` 为什么空着：CTL / ATL / TSB 是拿**单次训练负荷**逐日累加算出来的，而单次训练负荷不在导出包里。活动摘要只有 `aerobic_te` / `anaerobic_te`（有氧 / 无氧训练效果），`TrainingHistory` 只有设备已经算好的周负荷与训练状态。缺了输入就复现不出佳明那套口径，用训练效果去近似得到的数字不是同一个东西，所以不做。
 >
-> 想看体能走向时，用 `get_training_status` 里的 `fitness_trend`（体能水平趋势）与 `load_position`（周负荷落在最优负荷区间的哪一侧）。
+> 想看体能走向时，用 `get_training_status` 里的 `fitness_trend`（体能水平趋势）与 `load_position`（周负荷落在最优负荷区间的哪一侧）；或者直接看 `get_race_predictions` 的预测时间——那是设备按当前体能推算的能力值，比用训练效果拼出来的曲线可信。
+
+> 预测与摄氧量有两处口径要注意：
+>
+> - **预测不是成绩。** `get_race_predictions` 给的是手表按当前体能推算的完赛时间，不是已经跑出来的比赛成绩。
+> - **摄氧量的记录很稀疏。** 只有设备测出有效数据的日子才有一条（实测 604 天里 88 天）。样本之间的空缺不代表数值下降，工具也不按天插值。
+> - 归档里的 `fitnessAge` 恒为占位值，没有可用信息，因此不输出。
 
 ### 第三档：原始数据与写回
 
