@@ -9,6 +9,9 @@ from garmaple.stats import (
     human_duration,
     human_pace,
     pace_from_speed,
+    pearson_r,
+    recovery_correlations,
+    spearman_rho,
     summarize,
     zone_summary,
 )
@@ -360,3 +363,126 @@ def test_training_load_series_over_42_days_converges():
     out = training_load_series(data)
     assert len(out) == 42
     assert out[-1]["ctl"] == pytest.approx(31.6, abs=1.0)
+
+
+# ---------------- 恢复与表现的相关性 ----------------
+
+
+def test_pearson_perfect_lines():
+    assert pearson_r([1, 2, 3], [2, 4, 6]) == pytest.approx(1.0)
+    assert pearson_r([1, 2, 3], [6, 4, 2]) == pytest.approx(-1.0)
+
+
+def test_pearson_known_value():
+    """手算锚点：xs=[1..5], ys=[2,4,5,4,5] → cov=6, √(vx·vy)=√60，r≈0.7746。"""
+    r = pearson_r([1, 2, 3, 4, 5], [2, 4, 5, 4, 5])
+    assert r == pytest.approx(6 / 60**0.5)
+
+
+def test_pearson_zero_variance_returns_none():
+    """x 恒定时不给 0——「没法算」与「无关」是两件事。"""
+    assert pearson_r([5, 5, 5, 5], [1, 2, 3, 4]) is None
+    assert pearson_r([1, 2, 3, 4], [7, 7, 7, 7]) is None
+
+
+def test_spearman_captures_monotonic_nonlinear():
+    """y = x² 单调但非线性：Pearson 不到 1，Spearman 应为 1。"""
+    xs = [float(i) for i in range(1, 11)]
+    ys = [x * x for x in xs]
+    assert pearson_r(xs, ys) < 0.99
+    assert spearman_rho(xs, ys) == pytest.approx(1.0)
+
+
+def test_spearman_handles_ties():
+    """并列取平均秩：ys=[1,2,2,4] 的秩是 [1, 2.5, 2.5, 4]，ρ≈0.949。"""
+    rho = spearman_rho([1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 2.0, 4.0])
+    assert rho == pytest.approx(0.9487, abs=0.001)
+
+
+def test_recovery_correlations_too_few_pairs():
+    """5 个样本不够任何一项：不给系数，只给计数与所需样本量。"""
+    samples = [
+        {
+            "pace_s_per_km": 360.0 - i,
+            "sleep_min": 420 + i,
+            "prev_stress_avg": 30 + i,
+        }
+        for i in range(5)
+    ]
+    out = recovery_correlations(samples)
+    assert out["available"] is False
+    assert out["samples"] == 5
+    by_key = {c["key"]: c for c in out["correlations"]}
+    entry = by_key["sleep_min"]
+    assert entry["available"] is False
+    assert entry["reason"] == "too_few_pairs"
+    assert entry["n"] == 5
+    assert entry["needed"] == 10
+    assert "pearson_r" not in entry
+
+
+def test_recovery_correlations_counts_missing_pairs():
+    """各 x 的 n 不同：x 缺记录的对不参与，n 是「同时有记录」的对数。"""
+    samples = [
+        {
+            "pace_s_per_km": 360.0,
+            "sleep_min": 420,
+            "prev_bb_end": None if i % 2 else 50,
+        }
+        for i in range(12)
+    ]
+    out = recovery_correlations(samples)
+    by_key = {c["key"]: c for c in out["correlations"]}
+    assert by_key["sleep_min"]["n"] == 12
+    assert by_key["prev_bb_end"]["n"] == 6
+    assert by_key["prev_stress_avg"]["n"] == 0
+    assert by_key["prev_stress_avg"]["reason"] == "too_few_pairs"
+
+
+def test_recovery_correlations_strong_negative_is_significant():
+    """睡得越多配速越快的理想数据：r=-1，过 α=0.05 的显著性门槛。"""
+    samples = [
+        {
+            "pace_s_per_km": 360.0 - i,
+            "sleep_min": 420 + i,
+            "deep_min": 90,  # 恒定：应判 no_variance 而不是 r=0
+        }
+        for i in range(12)
+    ]
+    out = recovery_correlations(samples)
+    assert out["available"] is True
+    by_key = {c["key"]: c for c in out["correlations"]}
+
+    entry = by_key["sleep_min"]
+    assert entry["available"] is True
+    assert entry["n"] == 12
+    assert entry["pearson_r"] == pytest.approx(-1.0)
+    assert entry["spearman_rho"] == pytest.approx(-1.0)
+    assert entry["significant"] is True
+    assert 0 < entry["crit_r_05"] < 1
+
+    # 恒定值不给系数：no_variance，不会冒出「深睡与配速无关」的假结论
+    deep = by_key["deep_min"]
+    assert deep["available"] is False
+    assert deep["reason"] == "no_variance"
+
+
+def test_recovery_correlations_notes_always_present():
+    """统计口径的提醒必须随结果走，不能靠调用方记得。"""
+    out = recovery_correlations([])
+    assert out["samples"] == 0
+    assert out["available"] is False
+    assert any("因果" in n for n in out["notes"])
+    assert any("显著" in n for n in out["notes"])
+    assert any("越小越快" in v for v in out["y"].values())
+
+
+def test_recovery_correlations_significance_threshold_grows_with_n():
+    """n 越小门槛越高：8 对时 |r| 要过 0.632，n=40 时只需 0.304。"""
+    from garmaple.stats import _r_critical
+
+    assert _r_critical(10) == pytest.approx(0.632)
+    assert _r_critical(12) == pytest.approx(0.576)
+    assert _r_critical(42) == pytest.approx(0.304)
+    # n 不足时连门槛都不给——根本谈不上显著
+    assert _r_critical(9) is None

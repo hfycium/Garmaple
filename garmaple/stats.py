@@ -302,6 +302,168 @@ CTL_DAYS = 42
 ATL_DAYS = 7
 
 
+# ---------- 恢复与表现的相关性 ----------
+
+# 每个相关系数至少要这么多对样本。低于这个数，r 的抽样误差比大多数真实
+# 效应还大（df=8 时 |r| 得超过 0.63 才谈得上显著），继续算只会误导。
+MIN_CORR_PAIRS = 10
+
+# Pearson |r| 的 α=0.05 双侧临界值（df = n − 2，取自常用统计表）。
+# df 不在表里时取「不超过它的最大档」——更保守，宁可不标显著也不放宽。
+_R_CRIT_05 = {
+    8: 0.632, 9: 0.602, 10: 0.576, 11: 0.553, 12: 0.532,
+    13: 0.514, 14: 0.497, 15: 0.482, 16: 0.468, 17: 0.456,
+    18: 0.444, 19: 0.433, 20: 0.423, 22: 0.404, 24: 0.388,
+    26: 0.374, 28: 0.361, 30: 0.349, 35: 0.325, 40: 0.304,
+    45: 0.288, 50: 0.273, 60: 0.250, 70: 0.232, 80: 0.217,
+    90: 0.205, 100: 0.195, 120: 0.178,
+}
+
+# 参与相关的恢复侧变量（x）。y 固定为平均配速。
+# 键名是样本行里的字段，标签是给人看的口径说明。
+RECOVERY_VARS = (
+    ("sleep_min", "前一晚睡着时长（分钟）"),
+    ("deep_min", "前一晚深睡时长（分钟）"),
+    ("rem_min", "前一晚 REM 时长（分钟）"),
+    ("prev_stress_avg", "前一日平均压力"),
+    ("prev_bb_end", "前一日结束时的身体电量"),
+    ("resting_hr", "当日静息心率（bpm）"),
+)
+
+PACE_KEY = "pace_s_per_km"
+
+
+def _rank(values: list[float]) -> list[float]:
+    """平均秩：并列值各取它们秩的平均，Spearman 处理并列必备。"""
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        avg = (i + j) / 2 + 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        i = j + 1
+    return ranks
+
+
+def pearson_r(xs: list[float], ys: list[float]) -> float | None:
+    """Pearson 相关系数。x 或 y 无波动（恒定值）时返回 None，不返回 0。
+
+    「完全没变化」与「线性无关」是两件事：全员静息心率都是 48 时，
+    算出 r=0 会被读成「静息心率与配速无关」，实际是根本没法算。
+    """
+    n = len(xs)
+    if n < 2:
+        return None
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx <= 0 or vy <= 0:
+        return None
+    return cov / (vx * vy) ** 0.5
+
+
+def spearman_rho(xs: list[float], ys: list[float]) -> float | None:
+    """Spearman 等级相关：先换成秩再算 Pearson。
+
+    它是 Pearson 的稳健性对照——个别几次极快/极慢的训练能把 Pearson
+    拉出个不存在的线性关系，秩相关对这种极端值不敏感。
+    """
+    return pearson_r(_rank(xs), _rank(ys))
+
+
+def _r_critical(n: int) -> float | None:
+    """α=0.05 双侧下 |r| 达到显著的临界值；n 不足时返回 None。"""
+    df = n - 2
+    if df < 8:
+        return None
+    known = max(d for d in _R_CRIT_05 if d <= df)
+    if known == df:
+        return _R_CRIT_05[df]
+    # 表外的 df 用相邻更小的档：临界值取大的那个，判定更严
+    return _R_CRIT_05[known]
+
+
+def recovery_correlations(samples: Iterable[Mapping[str, Any] | Any]) -> dict[str, Any]:
+    """恢复指标与训练表现（平均配速）的相关性，一次算一组。
+
+    口径：
+
+    - 样本行是「一次训练」，y 是当天的平均配速（秒/公里）。y 越小越快，
+      因此 **r 为负表示 x 越高跑得越快**——这与「压力高跑得慢」的正 r
+      是同一个事实的两种读法，方向说明必须跟着输出走。
+    - 每个 x 单独取「x 与 y 同时有记录」的对数。不同 x 的 n 不同，
+      样本最少的那一项最不可靠。
+    - n 不足 `MIN_CORR_PAIRS` 的项不给系数，只给计数与所需样本量——
+      小样本的 r 看起来也能很大，但那基本是噪声。
+    - 显著性按 Pearson、α=0.05 双侧判定；Spearman 一并给出作对照。
+      两者差得远时，说明结果被个别极端值或非线性关系主导，别只引用
+      Pearson 那个好看的数。
+    - 一次算多项相关，α=0.05 下每 20 项就有一项纯靠运气显著；
+      「六项里恰好有一项显著」完全可能是巧合，notes 里必须带上这条。
+    """
+    rows = list(samples)
+    out: dict[str, Any] = {
+        "y": {PACE_KEY: "平均配速（秒/公里），数值越小越快"},
+        "samples": len(rows),
+    }
+
+    correlations: list[dict[str, Any]] = []
+    for key, label in RECOVERY_VARS:
+        pairs = [
+            (x, y)
+            for x, y in (
+                (_get(r, key), _get(r, PACE_KEY)) for r in rows
+            )
+            if x is not None and y is not None
+        ]
+        entry: dict[str, Any] = {"key": key, "label": label, "n": len(pairs)}
+        if len(pairs) < MIN_CORR_PAIRS:
+            entry["available"] = False
+            entry["reason"] = "too_few_pairs"
+            entry["needed"] = MIN_CORR_PAIRS
+            correlations.append(entry)
+            continue
+
+        xs = [p[0] for p in pairs]
+        ys = [p[1] for p in pairs]
+        r = pearson_r(xs, ys)
+        rho = spearman_rho(xs, ys)
+        if r is None or rho is None:
+            entry["available"] = False
+            entry["reason"] = "no_variance"
+            correlations.append(entry)
+            continue
+
+        entry["available"] = True
+        entry["pearson_r"] = round(r, 2)
+        entry["spearman_rho"] = round(rho, 2)
+        crit = _r_critical(len(pairs))
+        if crit is not None:
+            entry["significant"] = abs(r) >= crit
+            entry["crit_r_05"] = round(crit, 3)
+        correlations.append(entry)
+
+    out["correlations"] = correlations
+    out["available"] = any(e["available"] for e in correlations)
+    out["notes"] = [
+        "相关不是因果：恢复好的人往往也排在强度课那天，配速快可能来自课表"
+        "而不是恢复本身，本工具分不开这两件事",
+        "显著性按 Pearson、α=0.05 双侧判定（crit_r_05 是 |r| 的门槛）；"
+        "Spearman 是稳健性对照，两者差得远时结果受个别极端值影响",
+        "一次算多项相关，纯靠运气也会出「显著」：α=0.05 下每 20 项约有 1 项，"
+        "对单项显著不必过度解读",
+        "各 x 的 n 是「x 与 y 同时有记录」的对数，彼此不同；样本最少的那项最不可靠",
+        "y 是配速（秒/公里），r 为负 = x 越高跑得越快",
+    ]
+    return out
+
+
 def training_load_series(
     daily_tss: Iterable[tuple[str, float]],
 ) -> list[dict[str, Any]]:
