@@ -7,19 +7,22 @@ from __future__ import annotations
 
 import sys
 from collections import Counter
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from .archive import ArchiveError, discover
 from .config import Config
 from .parser.fit import downsample, sample_summary
+from .parser.sleep import STATUS_OK
 from .parser.metrics import RACE_DISTANCES_KM
 from .parser.records import GROUPS, GearUsage
 from .privacy import Privacy
 from .stats import (
+    PACE_KEY,
     human_duration,
     human_pace,
     pace_hr_drift,
+    recovery_correlations,
     summarize,
     training_load_series,
     zone_summary,
@@ -51,10 +54,10 @@ INSTRUCTIONS = """\
 当前索引包含：活动摘要（含心率区间累计时长）、每日 wellness 汇总（步数、
 静息心率、压力、身体电量、强度分钟）、睡眠（时长与分期）、训练状态（状态
 判定、周训练负荷、负荷隧道）、比赛成绩预测（5K / 10K / 半马 / 全马）、
-最大摄氧量、个人最佳纪录、装备里程、以及从原始 .fit 解析出的逐秒曲线
-（心率、配速、海拔、步频；覆盖大部分活动但不是全部）。
+最大摄氧量、个人最佳纪录、装备里程、恢复指标与配速的相关性、以及从原始
+.fit 解析出的逐秒曲线（心率、配速、海拔、步频；覆盖大部分活动但不是全部）。
 
-八点必须注意：
+九点必须注意：
 - 睡眠记录按**醒来日**归档。问「昨晚睡得怎么样」要查今天那条，
   查昨天会拿到前一晚的数据。
 - 官方导出包里没有睡眠评分数值。
@@ -79,6 +82,9 @@ INSTRUCTIONS = """\
   只代表**归档里没记**，不等于没跑过，不要报 0 公里。
 - 心率区间只有**每档累计时长**，没有区间上下限（bpm），也没有区间个数设置。
   因此回答不了「Z3 是多少 bpm」，也不要把 zone_N 直接叫成 Z1-Z5 或有氧区间。
+- get_recovery_correlation 只做统计描述。相关不等于因果，配速快慢同时受
+  课表安排影响（睡得好、状态好的日子往往也是排强度课的日子）；样本不足
+  10 对的项不给系数，也不要替它下结论。
 """
 
 
@@ -821,6 +827,160 @@ def build_server(cfg: Config) -> Any:
                 result["truncated"] = True
                 result["note"] += f" 区间超 {capped} 天，只返回最近 {capped} 天"
             return result
+
+    @mcp.tool()
+    def get_recovery_correlation(
+        start_date: str | None = None,
+        end_date: str | None = None,
+        sport: str | None = "running",
+        min_distance_km: float = 3.0,
+    ) -> dict[str, Any]:
+        """恢复与表现的相关性：睡眠 / 压力 / 身体电量 / 静息心率 对 配速。
+
+        纯统计描述工具：把每次训练配成一个样本行——
+
+            y   当天平均配速（秒/公里，数值越小越快）
+            x   前一晚睡眠（睡着 / 深睡 / REM，按醒来日取**当天**那条）、
+                前一日平均压力、前一日结束时的身体电量、当日静息心率
+
+        对每个 x 算 Pearson 与 Spearman 相关系数，并给出 α=0.05 双侧的
+        显著性判定。**相关不是因果**：睡得好、状态好的日子往往也是排
+        强度课的日子，配速快可能来自课表而不是恢复，本工具分不开这两件事。
+
+        口径与限制（notes 字段会随结果原样返回）：
+
+        - 每个样本行至少 `min_distance_km` 公里且时长满 5 分钟——热身与
+          碎片记录的配速没有分析价值。
+        - 同一天多次训练只取**距离最长的一次**：同一晚睡眠不该被算进
+          两个样本行，否则 n 是虚的。
+        - 各 x 的 n 是「x 与 y 同时有记录」的对数，彼此不同；不足 10 对
+          的项不给系数，只给计数。
+        - 静息心率是当日（含当夜睡眠期间）的日汇总值，不是晨脉。
+
+        参数：
+            start_date / end_date  YYYY-MM-DD，含端点，均可省略
+            sport            只看某项运动，默认 running；传空串则合并
+                             全部运动（不同运动的配速混在一起没有意义，
+                             不建议）
+            min_distance_km  样本行的最短距离门槛，默认 3 公里
+
+        睡眠或每日汇总缺失时各项的 n 会明显缩水，先看 sample 里的计数
+        再解读，不要把「没记录」当成「睡了 0 分钟」或「没压力」。
+        """
+        if not 0 < float(min_distance_km) <= 100:
+            raise ToolError(f"min_distance_km 需在 0~100 之间，收到 {min_distance_km}")
+        min_m = float(min_distance_km) * 1000.0
+        start = _date(start_date, "start_date")
+        end = _date(end_date, "end_date")
+        if start and end and start > end:
+            raise ToolError("start_date 不能晚于 end_date")
+
+        sport_filter = (sport or "").strip().lower() or None
+
+        with _store() as store:
+            acts = store.query_activities(
+                start=start, end=end, sport=sport_filter, order="asc"
+            )
+
+            # 同日多次只留最长的一次。放在距离门槛之后数，multi 才是
+            # 「因去重被丢掉的真实训练」而不是「本来就不合格的热身」。
+            by_date: dict[str, Any] = {}
+            multi_session_days = 0
+            for row in acts:
+                d = row["date"]
+                dist = row["distance_m"] or 0.0
+                dur = row["duration_s"] or 0.0
+                if not d or dist < min_m or dur < 300:
+                    continue
+                if d in by_date:
+                    multi_session_days += 1
+                    if (by_date[d]["distance_m"] or 0) >= dist:
+                        continue
+                by_date[d] = row
+
+            if not by_date:
+                return {
+                    "available": False,
+                    "reason": "no_eligible_sessions",
+                    "sport_filter": sport_filter,
+                    "min_distance_km": min_distance_km,
+                    "activities_in_range": len(acts),
+                    "hint": (
+                        "该区间没有满足门槛的训练（距离不足或时长不足 5 分钟），"
+                        "可先用 get_data_overview 确认数据覆盖范围，"
+                        "或调低 min_distance_km"
+                    ),
+                }
+
+            # 睡眠按醒来日对齐：活动日 D 配的正是「当天早上醒来」那条，
+            # 也就是训练前一夜。days 需要覆盖到最早活动日的前一天
+            # （前一日压力 / 身体电量），所以整表读入再按日期查——
+            # 两张表都只有几百行，不值得为省内存写区间拼接。
+            sleeps = {
+                r["date"]: r
+                for r in store.query_sleeps()
+                if r["status"] == STATUS_OK
+            }
+            days = {r["date"]: r for r in store.query_days()}
+
+            samples: list[dict[str, Any]] = []
+            for d in sorted(by_date):
+                row = by_date[d]
+                dist = row["distance_m"]
+                dur = row["duration_s"]
+                pace = dur / (dist / 1000.0) if dist else None
+
+                srow = sleeps.get(d)
+                sleep_min = None
+                if srow is not None and srow["in_bed_min"] is not None:
+                    # 睡着 = 窗口 − 清醒 − 测不到，与索引层同一套口径
+                    raw = (
+                        srow["in_bed_min"]
+                        - (srow["awake_min"] or 0)
+                        - (srow["unmeasured_min"] or 0)
+                    )
+                    sleep_min = raw if raw > 0 else None
+
+                prev = (date.fromisoformat(d) - timedelta(days=1)).isoformat()
+                prow = days.get(prev)
+                drow = days.get(d)
+                samples.append(
+                    {
+                        "date": d,
+                        PACE_KEY: round(pace, 1) if pace else None,
+                        "sleep_min": sleep_min,
+                        "deep_min": srow["deep_min"] if srow else None,
+                        "rem_min": srow["rem_min"] if srow else None,
+                        "prev_stress_avg": prow["stress_avg"] if prow else None,
+                        "prev_bb_end": prow["bb_end"] if prow else None,
+                        "resting_hr": drow["resting_hr"] if drow else None,
+                    }
+                )
+
+            result = recovery_correlations(samples)
+
+        dates = sorted(by_date)
+        out: dict[str, Any] = {
+            "available": result["available"],
+            "sport_filter": sport_filter,
+            "min_distance_km": min_distance_km,
+            "range": {"from": dates[0], "to": dates[-1]},
+            "sample": {
+                "activities_in_range": len(acts),
+                "sessions_used": len(samples),
+                "multi_session_days_dropped": multi_session_days,
+            },
+            "y": result["y"],
+            "correlations": result["correlations"],
+            "notes": result["notes"],
+        }
+        if not result["available"]:
+            out["hint"] = (
+                "样本不足：每个相关系数至少要 10 对同时有记录的样本。"
+                "睡眠或每日汇总缺失会让各项 n 缩水，先看 sample 与各项 n "
+                "判断缺的是哪部分数据；若索引早于本功能，请重跑 garmaple index"
+            )
+        return out
 
     @mcp.tool()
     def get_race_predictions(

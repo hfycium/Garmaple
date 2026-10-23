@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from garmaple.privacy import pseudo_activity_id
 
 from .test_cli import build_archive
+from .test_activities import make_raw
 
 
 def prepared(tmp_path: Path, days: int = 3, privacy: str = "strict", fits: int = 0, **kwargs) -> Config:
@@ -54,7 +56,8 @@ def test_daily_summary_tool_is_registered(tmp_path: Path) -> None:
     assert "get_activity_streams" in names
     assert "get_pace_hr_drift" in names
     assert "get_training_load" in names
-    assert len(names) == 15
+    assert "get_recovery_correlation" in names
+    assert len(names) == 16
 
 
 def test_hr_zones_distribution(tmp_path: Path) -> None:
@@ -918,3 +921,217 @@ def test_streams_without_power_leaves_power_column_out(tmp_path: Path) -> None:
 
     assert "power_w" not in out["series"]
     assert "power_w" in out["series_missing"]
+
+
+# ---------------- 恢复与表现的相关性 ----------------
+
+
+def _correlation_archive(root: Path, days: int = 12) -> Path:
+    """连续 days 个训练日的合成导出包，专门喂 get_recovery_correlation。
+
+    设计（第 i 天，i 从 0 起）：
+
+        训练       8 km，配速 360−i 秒/公里（越往后越快）
+        睡眠       醒来日 = 训练当天，睡着 420+i 分钟（越睡越多）
+        日汇总     从训练首日前一天开始，覆盖每一天；
+                   压力 30+i、身体电量终值 (5i)%100、静息心率 48+i
+
+    于是「睡眠 / 压力 / 电量 / 静息心率」四个变量与配速都是严格线性
+    （r = −1），而深睡与 REM 恒定——用来验证 no_variance 不给假结论。
+    """
+    from datetime import date, datetime, timedelta, timezone
+
+    from .test_daily import make_block
+    from .test_sleep import make_sleep
+
+    path = root / "export.zip"
+    acts, sleeps, daily = [], [], []
+    first_wake = date(2026, 7, 21)
+
+    for i in range(days):
+        wake = first_wake + timedelta(days=i)
+        begin_ms = int(
+            datetime(wake.year, wake.month, wake.day, 3, 0, tzinfo=timezone.utc)
+            .timestamp() * 1000
+        )
+        pace = 360 - i
+        acts.append(
+            make_raw(
+                activityId=2000 + i,
+                beginTimestamp=begin_ms,
+                startTimeLocal=begin_ms + 8 * 3_600_000,
+                distance=800_000.0,          # 8 km
+                duration=float(pace * 8 * 1000),
+                avgSpeed=round((1000.0 / pace) / 10, 6),  # 原始值，×10 才是 m/s
+            )
+        )
+
+        prev = wake - timedelta(days=1)
+        start_gmt = datetime(prev.year, prev.month, prev.day, 15, 20)
+        end_gmt = start_gmt + timedelta(minutes=420 + i)
+        sleeps.append(
+            make_sleep(
+                calendarDate=wake.isoformat(),
+                sleepStartTimestampGMT=start_gmt.strftime("%Y-%m-%dT%H:%M:%S.0"),
+                sleepEndTimestampGMT=end_gmt.strftime("%Y-%m-%dT%H:%M:%S.0"),
+                awakeSleepSeconds=0,
+                unmeasurableSeconds=0,
+            )
+        )
+
+    # 日汇总从训练首日**前一天**写到末日：首日的前一日压力 / 电量、
+    # 末日的静息心率都要拿得到，配对才不会缺角
+    for k in range(days + 1):
+        day = first_wake - timedelta(days=1) + timedelta(days=k)
+        blk = make_block(calendarDate=day.isoformat(), restingHeartRate=48 + k)
+        blk["allDayStress"]["aggregatorList"][1]["averageStressLevel"] = 30 + k
+        for item in blk["bodyBattery"]["bodyBatteryStatList"]:
+            if item["bodyBatteryStatType"] == "ENDOFDAY":
+                item["statsValue"] = (5 * k) % 100
+        daily.append(blk)
+
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr(
+            "DI_CONNECT/DI-Connect-Fitness/9000_1_summarizedActivities.json",
+            json.dumps([{"summarizedActivitiesExport": acts}]),
+        )
+        zf.writestr(
+            "DI_CONNECT/DI-Connect-Wellness/2026-07-20_2026-08-05_9000_sleepData.json",
+            json.dumps(sleeps),
+        )
+        zf.writestr(
+            "DI_CONNECT/DI-Connect-Aggregator/UDSFile_2026-07-20_2026-08-05.json",
+            json.dumps(daily),
+        )
+    return path
+
+
+def _correlation_cfg(tmp_path: Path, days: int = 12) -> Config:
+    data = tmp_path / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    _correlation_archive(data, days=days)
+    cfg = Config(data_dir=data, cache_dir=tmp_path / "cache", privacy="strict")
+    main(["--data", str(cfg.data_dir), "--cache", str(cfg.cache_dir), "index"])
+    return cfg
+
+
+def test_recovery_correlation_end_to_end(tmp_path: Path) -> None:
+    """理想线性数据下：四个变量与配速 r=−1 且显著；恒定项不给假系数。"""
+    cfg = _correlation_cfg(tmp_path)
+    out = call(cfg, "get_recovery_correlation", {})
+
+    assert out["available"] is True
+    assert out["sample"]["sessions_used"] == 12
+    assert out["sample"]["multi_session_days_dropped"] == 0
+    assert out["range"] == {"from": "2026-07-21", "to": "2026-08-01"}
+
+    by_key = {c["key"]: c for c in out["correlations"]}
+
+    # 睡眠按醒来日对齐：每个训练日都配上了前一晚，n=12
+    assert by_key["sleep_min"]["n"] == 12
+    assert by_key["sleep_min"]["pearson_r"] == pytest.approx(-1.0)
+    assert by_key["sleep_min"]["significant"] is True
+
+    # 前一日压力 / 电量：日汇总覆盖了首日的前一天，同样 n=12
+    assert by_key["prev_stress_avg"]["n"] == 12
+    assert by_key["prev_stress_avg"]["pearson_r"] == pytest.approx(-1.0)
+    assert by_key["prev_bb_end"]["pearson_r"] == pytest.approx(-1.0)
+
+    assert by_key["resting_hr"]["pearson_r"] == pytest.approx(-1.0)
+
+    # 深睡 / REM 恒定：no_variance，不给「与配速无关」的假结论
+    assert by_key["deep_min"]["reason"] == "no_variance"
+    assert by_key["rem_min"]["reason"] == "no_variance"
+
+
+def test_recovery_correlation_dedupes_same_day_sessions(tmp_path: Path) -> None:
+    """同日两次训练只取最长的一次：同一晚睡眠不能算进两行。"""
+    from datetime import datetime, timedelta, timezone
+
+    from .test_activities import make_raw
+
+    data = tmp_path / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    path = _correlation_archive(data, days=12)
+
+    # 追加一次同日的短距离训练（8 km 之外再来个 3 km），改写 zip 里的活动分片
+    with zipfile.ZipFile(path) as zf:
+        payload = json.loads(
+            zf.read("DI_CONNECT/DI-Connect-Fitness/9000_1_summarizedActivities.json")
+        )[0]["summarizedActivitiesExport"]
+        inner = {n: zf.read(n) for n in zf.namelist()}
+
+    base = datetime(2026, 7, 21, 3, 0, tzinfo=timezone.utc)
+    begin_ms = int(base.timestamp() * 1000)
+    payload.append(
+        make_raw(
+            activityId=2999,
+            beginTimestamp=begin_ms + 6 * 3_600_000,  # 同一天，晚 6 小时
+            startTimeLocal=begin_ms + 6 * 3_600_000 + 8 * 3_600_000,
+            distance=300_000.0,
+            duration=1_080_000.0,
+            avgSpeed=round((1000.0 / 360) / 10, 6),
+        )
+    )
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, blob in inner.items():
+            if name.endswith("summarizedActivities.json"):
+                zf.writestr(name, json.dumps([{"summarizedActivitiesExport": payload}]))
+            else:
+                zf.writestr(name, blob)
+
+    cfg = Config(data_dir=data, cache_dir=tmp_path / "cache2", privacy="strict")
+    main(["--data", str(cfg.data_dir), "--cache", str(cfg.cache_dir), "index"])
+    out = call(cfg, "get_recovery_correlation", {})
+
+    assert out["sample"]["activities_in_range"] == 13
+    assert out["sample"]["sessions_used"] == 12
+    assert out["sample"]["multi_session_days_dropped"] == 1
+    # 留下的应是 8 km 那次：首日配速 360（3 km 那次是 360 也一样，
+    # 但用睡眠相关的 n 不变来确认没有多出样本行）
+    assert out["correlations"][0]["n"] == 12
+
+
+def test_recovery_correlation_without_sleep_data(tmp_path: Path) -> None:
+    """没有睡眠分片：各项 n 为 0，工具解释缺的是哪块而不是报错。"""
+    cfg = prepared(tmp_path, sleeps=0)
+    out = call(cfg, "get_recovery_correlation", {})
+
+    assert out["available"] is False
+    assert "hint" in out
+    by_key = {c["key"]: c for c in out["correlations"]}
+    assert all(c["n"] == 0 for c in out["correlations"])
+    assert by_key["sleep_min"]["reason"] == "too_few_pairs"
+
+
+def test_recovery_correlation_no_eligible_sessions(tmp_path: Path) -> None:
+    """距离门槛把所有活动挡掉时给出原因，而不是空样本硬算。"""
+    cfg = prepared(tmp_path)
+    out = call(cfg, "get_recovery_correlation", {"min_distance_km": 100})
+
+    assert out["available"] is False
+    assert out["reason"] == "no_eligible_sessions"
+    assert out["activities_in_range"] == 2
+    assert "hint" in out
+
+
+def test_recovery_correlation_rejects_bad_min_distance(tmp_path: Path) -> None:
+    cfg = prepared(tmp_path)
+    with pytest.raises((ToolError, UnexpectedToolError)):
+        call(cfg, "get_recovery_correlation", {"min_distance_km": 0})
+    with pytest.raises((ToolError, UnexpectedToolError)):
+        call(cfg, "get_recovery_correlation", {"min_distance_km": 500})
+
+
+def test_recovery_correlation_respects_date_range(tmp_path: Path) -> None:
+    """区间筛选生效：只统计区间内的训练日。"""
+    cfg = _correlation_cfg(tmp_path)
+    out = call(
+        cfg,
+        "get_recovery_correlation",
+        {"start_date": "2026-07-25", "end_date": "2026-07-28"},
+    )
+    assert out["range"] == {"from": "2026-07-25", "to": "2026-07-28"}
+    assert out["sample"]["sessions_used"] == 4
+    # 样本不足 10 对：区间内样本不够时不给系数
+    assert out["available"] is False
