@@ -70,7 +70,7 @@ class Config:
         if not self.data_dir.exists():
             raise ConfigError(
                 f"数据目录不存在：{self.data_dir}\n"
-                "请从 connect.garmin.cn 或 connect.garmin.com 导出数据，"
-                "解压后把导出包放进该目录（见 README 快速开始）。"
+                "请从 Garmin 官方导出数据，把下载的 .zip（或解压后的文件夹）\n"
+                "放进该目录（默认找当前目录下的 data/，见 README 开始使用）。"
             )
         return self.data_dir
