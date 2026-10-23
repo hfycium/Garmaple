@@ -35,11 +35,30 @@ Garmaple 会告诉你数据覆盖到哪一天、哪些数据缺失，也会说�
 
 ## 开始使用
 
-整个过程分三步，**登录 Garmin 官方页面这一步必须你自己做**，剩下的可以让 AI agent 帮你搞定。
+一共五步。哪一步都可以让 AI agent 代劳，但走通一遍之后，以后更新数据你自己就能搞定。
 
-> 「AI agent」指能操作你电脑文件和运行命令的 AI 助手（比如带本地操作能力的 Claude、Codex 等）。普通网页版聊天通常访问不了你电脑上的文件，也没法帮你配置 MCP 连接。
+### 第 1 步：安装 Garmaple
 
-### 第 1 步：向 Garmin 申请数据导出
+需要先装好 **Python 3.10 或更新版本**（[python.org](https://www.python.org/downloads/) 下载，安装时勾选「Add to PATH」）。
+
+然后在命令行里运行：
+
+```bash
+pip install git+https://github.com/hfycium/Garmaple.git
+```
+
+> ⚠️ Garmaple **还没有上架 PyPI**，`pip install garmaple` 是装不到的，认准上面这条。这条命令需要电脑上装有 [Git](https://git-scm.com/)。
+
+不熟命令行？把下面这句发给你的 agent 就行：
+
+```text
+请帮我在本机安装 GitHub 上的 Garmaple 项目：https://github.com/hfycium/Garmaple
+如果缺 Python 或 Git，请带我一步步装好。
+```
+
+装完运行 `garmaple --help`，能打印用法说明就成功了。
+
+### 第 2 步：向 Garmin 申请数据导出
 
 打开下面的页面，登录你的 Garmin 账号，找到「导出您的数据」并提交申请。
 
@@ -50,28 +69,53 @@ Garmin 准备好后会**发邮件给你下载链接**，收到后下载那个 `.
 
 > ⏳ 官方说明通常需要约 **48 小时**，最长可能到 30 天。这是 Garmin 官方流程，AI 帮不上忙，早点申请。
 
-下载完成后：**别解压**，**别删**，原样留着。
+### 第 3 步：把下载的 zip 拖进 data 文件夹
 
-### 第 2 步：告诉 agent 压缩包在哪
+1. 新建一个文件夹，当作 Garmaple 的家（比如就叫 `Garmaple`）；
+2. 在里面再建一个子文件夹，命名为 `data`；
+3. 把下载好的 `.zip` **原样拖进 `data`**：别解压、别改名、别删。
 
-把下载好的 `.zip` 放在你电脑的任意位置，然后把它所在的**文件夹路径**告诉 agent。
+Garmaple 默认就在它运行时所在目录下找 `data/` 文件夹，拖进去就能被读到。想放别处也行，后面配置里的 `GARMAPLE_DATA` 环境变量就是干这个的。
 
-如果不知道怎么找路径，直接告诉 agent 你用的是 Windows、macOS 还是 Linux，它会带你找。
+### 第 4 步：建索引、接入 AI
 
-把下面这段话发给 agent，把尖括号里的内容换成你的实际路径：
+在第 1 步那个 `Garmaple` 文件夹里打开命令行，依次运行：
+
+```bash
+garmaple index     # 解析导出包，建立本地索引
+garmaple doctor    # 自检：数据包、分片数量、索引状态、隐私级别
+```
+
+`doctor` 显示活动、睡眠等分片数量都正常后，在你的 AI 客户端的 MCP 配置里加上：
+
+```json
+{
+  "mcpServers": {
+    "garmaple": {
+      "command": "garmaple",
+      "args": ["serve"],
+      "env": {
+        "GARMAPLE_DATA": "<Garmaple 文件夹的完整路径>/data",
+        "GARMAPLE_PRIVACY": "strict"
+      }
+    }
+  }
+}
+```
+
+写完配置后，多数客户端需要在连接器或 MCP 管理界面手动启用、确认信任一次。如果你的 AI agent 能操作电脑，第 3、4 步也可以整个交给它——话术模板：
 
 ```text
-请帮我在本机安装和配置 Garmaple：https://github.com/hfycium/Garmaple
-我的 Garmin 导出 ZIP 在这里：<粘贴 ZIP 文件的完整路径>
-
+请帮我配置已安装的 Garmaple（MCP 仓库见 https://github.com/hfycium/Garmaple）：
+我的 Garmin 导出 ZIP 已经下载好了，请带我完成：
+1. 建好 data 文件夹并把 ZIP 放进去；
+2. 运行 garmaple index 和 garmaple doctor 建立并检查索引；
+3. 配置当前 AI 客户端的 MCP 连接并确认连通。
 请在本机处理数据，不要上传或分享这个 ZIP，也不要索要我的 Garmin 账号密码。
-请帮我完成安装、建立本地索引、配置当前 AI 客户端连接，并检查是否连通。
 我不熟悉命令行和 JSON；如果有步骤必须由我操作，请一次告诉我一个具体步骤。
 ```
 
-agent 会自己完成安装、建立索引、配好连接。如果你的 AI 客户端需要重启，它会提示你。
-
-### 第 3 步：直接开始问
+### 第 5 步：直接开始问
 
 连上之后，在对话里提问就行，比如：
 
@@ -79,9 +123,9 @@ agent 会自己完成安装、建立索引、配好连接。如果你的 AI 客�
 - 「最近一个月跑了多少？比较最近四周的训练量和配速。」
 - 「这次跑步后半程的心率和配速是否出现明显漂移？」
 
-**数据更新怎么办？** 回到第 1 步重新导出一份，让 agent 重新索引就行。索引是纯派生数据，重建不会丢东西。
+**数据更新怎么办？** 回到第 2、3 步：重新导出一份、拖进同一个 `data` 文件夹，再跑一次 `garmaple index`。索引是纯派生数据，重建不会丢东西。
 
-**AI 说找不到数据？** 让 agent 检查两件事：ZIP 是否放在 Garmaple 能读到的地方、索引是否建好了，以及 MCP 连的是不是同一份索引。
+**AI 说找不到数据？** 让 agent 用 `garmaple doctor` 检查三件事：ZIP 是否在 `data/` 里、索引是否建好、MCP 连的是不是同一份索引。
 
 ---
 
@@ -143,33 +187,15 @@ Garmaple 能控制的是**它返回给 AI 的内容**：
 - **活动与 `.fit` 文件之间没有共同编号。** 只能靠开始时间对齐，所以曲线不是每次活动都有。
 - **步频是单脚计数。** 跑步时每分钟步数大约是它的 2 倍。
 
-### 手动安装（如果你想自己来）
+### 配置细节（如果你想自己调）
 
-```bash
-pip install garmaple
-garmaple index     # 解析导出包，建立本地索引
-garmaple doctor    # 自检：数据包、分片数量、索引状态、隐私级别
-garmaple serve     # 启动 MCP 服务
-```
+- `GARMAPLE_DATA` —— 数据目录，默认是运行命令时所在目录下的 `data/`；
+- `GARMAPLE_CACHE` —— 索引存放目录，默认 `cache/`；
+- `GARMAPLE_PRIVACY` —— 隐私级别，默认 `strict`。
 
-导出包直接整个 `.zip` 放进 `data/` 就行，不用手动解压。在 MCP 客户端配置里加上：
+也可以不用环境变量，直接 `garmaple --data <路径> index`（注意 `--data` 要写在子命令前面；用 `garmaple --help` 看全部参数）。
 
-```json
-{
-  "mcpServers": {
-    "garmaple": {
-      "command": "garmaple",
-      "args": ["serve"],
-      "env": {
-        "GARMAPLE_DATA": "/path/to/Garmaple/data",
-        "GARMAPLE_PRIVACY": "strict"
-      }
-    }
-  }
-}
-```
-
-写完配置后，多数客户端需要在连接器或 MCP 管理界面手动启用、确认信任一次。
+数据目录里放**整个导出 `.zip`** 或解压后的文件夹都行，多个包混放也可以，会一起解析、按活动去重。
 
 > 升级到新版本后需要重新跑一次 `garmaple index`。索引是纯派生数据，版本号对不上时会被整库丢弃——包括「列没变、但列里存的东西变了」的情况（例如心率区间的单位从毫秒改成秒）。工具此时会返回「请重新运行 index」的提示，不会拿旧数据凑合。
 
