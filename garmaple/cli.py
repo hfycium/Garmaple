@@ -308,6 +308,7 @@ def cmd_doctor(cfg: Config) -> int:
     _hr("配置")
     print(f"数据目录   {cfg.data_dir}  {'✓' if cfg.data_dir.exists() else '✗ 不存在'}")
     print(f"缓存目录   {cfg.cache_dir}")
+    print(f"数据库路径 {cfg.db_path}")
     print(f"隐私级别   {cfg.privacy}")
     ok &= cfg.data_dir.exists()
 

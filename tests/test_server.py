@@ -68,6 +68,38 @@ def test_activity_cadence_is_converted_to_both_feet(tmp_path: Path) -> None:
     assert "乘以 2" in out["cadence_note"]
 
 
+def test_strict_mcp_cleans_activity_name_when_it_matches_location(tmp_path: Path) -> None:
+    cfg = prepared(
+        tmp_path,
+        activity_name="深圳市 跑步",
+        location_name="深圳市",
+    )
+
+    out = call(cfg, "get_activity", {"activity_id": pseudo_activity_id(1000)})
+
+    assert out["name"] == "跑步"
+    assert "深圳市" not in json.dumps(out, ensure_ascii=False)
+
+
+def test_strict_mcp_free_text_boundary_in_nested_results(tmp_path: Path) -> None:
+    cfg = prepared(
+        tmp_path,
+        activity_name="深圳河畔晨跑",
+        location_name="未匹配地点",
+        gear_name="深圳路线训练鞋",
+    )
+
+    activity = call(cfg, "get_activity", {"activity_id": pseudo_activity_id(1000)})
+    gear_result = call(cfg, "get_gear_mileage", {})
+
+    assert activity["name"] == "深圳河畔晨跑"
+    assert gear_result["gears"][0]["name"] == "深圳路线训练鞋"
+    # strict 不返回地点坐标和结构化地点字段，但未匹配的自由文本可能含地点。
+    serialized = json.dumps({"activity": activity, "gear": gear_result}, ensure_ascii=False)
+    assert "深圳河畔晨跑" in serialized
+    assert "深圳路线训练鞋" in serialized
+
+
 def test_hr_zones_distribution(tmp_path: Path) -> None:
     """两条活动各 1800s/900s，合并后 3600s 与 1800s，占比 66.7 / 33.3。"""
     out = call(prepared(tmp_path), "get_hr_zones", {})

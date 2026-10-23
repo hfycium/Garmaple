@@ -54,6 +54,9 @@ def build_archive(
     workout_feel: int | None = None,
     power_w: int | None = None,
     tss: float | None = None,
+    activity_name: str | None = None,
+    location_name: str | None = None,
+    gear_name: str | None = None,
 ) -> Path:
     """造一个最小导出包：活动 + 日汇总 + 睡眠 + 训练 + 预测 + 摄氧量 + 纪录 + 装备。
 
@@ -75,6 +78,8 @@ def build_archive(
             activityId=1000 + i,
             beginTimestamp=_ACTIVITY_START_MS + i * 3_600_000,
             startTimeLocal=_ACTIVITY_START_MS + i * 3_600_000 + 8 * 3_600_000,
+            **({"name": activity_name} if activity_name is not None else {}),
+            **({"locationName": location_name} if location_name is not None else {}),
         )
         for i in range(activities)
     ]}]
@@ -153,8 +158,8 @@ def build_archive(
     # 一双有关联、一双没有——复刻实测情形：有装备的关联键整个不存在
     gear_block = make_gear_payload(
         [
-            make_gear(gearPk=700001, name="测试跑鞋甲"),
-            make_gear(gearPk=700002, name="测试跑鞋乙"),
+            make_gear(gearPk=700001, name=gear_name or "测试跑鞋甲"),
+            make_gear(gearPk=700002, name=gear_name or "测试跑鞋乙"),
         ][:gear_count],
         {
             "700001": [
@@ -420,6 +425,9 @@ def test_doctor_reports_counts(tmp_path: Path, capsys) -> None:
 
     assert main(args + ["doctor"]) == 0
     out = capsys.readouterr().out
+    assert f"数据目录   {cfg.data_dir}" in out
+    assert f"缓存目录   {cfg.cache_dir}" in out
+    assert f"数据库路径 {cfg.db_path}" in out
     assert "活动       2 条" in out
     assert "心率区间   2/2 条活动有区间数据" in out
     assert "每日汇总   2 天" in out
@@ -450,4 +458,8 @@ def test_index_and_doctor_report_fit_coverage(tmp_path: Path, capsys) -> None:
 def test_doctor_fails_before_index(tmp_path: Path, capsys) -> None:
     cfg = make_config(tmp_path)
     assert main(["--data", str(cfg.data_dir), "--cache", str(cfg.cache_dir), "doctor"]) == 1
-    assert "尚未建立索引" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert f"数据目录   {cfg.data_dir}" in out
+    assert f"缓存目录   {cfg.cache_dir}" in out
+    assert f"数据库路径 {cfg.db_path}" in out
+    assert "尚未建立索引" in out

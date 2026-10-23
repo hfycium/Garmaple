@@ -25,66 +25,46 @@ Garmaple 会说明数据覆盖范围和缺失项。相关性只是统计关系�
 
 ## 开始使用
 
-### 1. 导出佳明数据
+你可以让能操作本机文件和运行命令的 **AI agent** 帮你安装、配置 Garmaple，然后直接用它分析数据。普通网页聊天通常无法访问你电脑上的文件，也无法替你配置本地 AI 工具连接（MCP）；使用前请确认当前 agent 支持本地操作和 MCP。
+
+### 1. 向 Garmin 申请数据导出
 
 打开对应的 Garmin 数据管理页面并登录账号，选择「导出您的数据」并提交导出请求。Garmin 准备好后会通过邮件发送下载链接；收到邮件后下载 `.zip` 压缩包。官方说明通常约需 48 小时，最长可能需要 30 天。详见 [Garmin 官方导出说明](https://support.garmin.com/en-US/?faq=W1TvTPW8JZ6LfJSfK512Q8)。
 
 - 中国区：[Garmin 数据导出](https://www.garmin.cn/zh-CN/account/datamanagement/exportdata)
 - 国际区：[Garmin 数据导出](https://www.garmin.com/account/datamanagement/exportdata)
 
-### 2. 安装并放入导出包
+登录和申请导出由你自己完成，不要把 Garmin 账号密码交给 agent。下载完成后保留 `.zip` 原样，不要解压，也不要把压缩包作为聊天附件发出去。
 
-需要 Python 3.10 或更新版本。先把项目下载到本机，然后在终端进入项目目录并安装：
+### 2. 把压缩包位置告诉 agent
 
-```bash
-git clone https://github.com/hfycium/Garmaple.git
-cd Garmaple
-pip install -e .
-```
+把 Garmin 导出 `.zip` 保存在本机，然后把它的**完整文件路径**告诉 agent。也可以等 agent 下载好 Garmaple 后，按它的指引把压缩包放进项目的 `data/` 文件夹。文件只留在本机，不要解压。
 
-在项目目录里找到或新建 `data/` 文件夹，用文件管理器把刚下载的 `.zip` 压缩包复制进去。不要解压。然后仍在 Garmaple 项目目录的终端里运行：
-
-```bash
-garmaple index
-garmaple doctor
-```
-
-目录放好后大致如下；压缩包名称可以不同，也可以把多个导出压缩包都放在 `data/` 里：
+如果不知道怎么复制文件路径，告诉 agent 你使用 Windows、macOS 还是 Linux，让它带你找到路径。你可以直接把下面这段发给 agent，并填入文件路径：
 
 ```text
-Garmaple/
-├── data/
-│   └── Garmin 导出.zip
-├── cache/                  # garmaple index 自动创建
-│   └── garmaple.sqlite3    # 本地索引
-└── README.md
+请帮我在本机安装和配置 Garmaple：https://github.com/hfycium/Garmaple
+我的 Garmin 导出 ZIP 在这里：<粘贴 ZIP 文件的完整路径>
+
+请在本机处理数据，不要上传或分享这个 ZIP，也不要索要我的 Garmin 账号密码。
+请帮我完成安装、建立本地索引、配置当前 AI 客户端连接，并检查是否连通。
+我不熟悉命令行和 JSON；如果有步骤必须由我操作，请一次告诉我一个具体步骤。
 ```
 
-`garmaple index` 会读取 `data/` 里的压缩包并建立本地索引，`garmaple doctor` 会检查是否可用。数据更新时，把新下载的压缩包也放进 `data/`，再次运行 `garmaple index`。原始压缩包不用解压或改名。
+agent 会在本机安装 Garmaple、读取导出包并建立索引。配置 MCP 时，它应使用建立索引时的同一份本地数据库，避免连接成功却读不到数据。安装过程中如果 AI 客户端需要重启，按 agent 的提示操作即可。
 
-### 3. 连接 AI 助手
+### 3. 直接向 AI 提问
 
-在支持 MCP 的 AI 客户端设置中添加 Garmaple 服务。把以下配置合并到客户端已有的 MCP 服务列表中，**不要覆盖其他服务**：
+连接后不用输入命令或记住工具名称，直接在 AI 对话里提问，例如：
 
-```json
-{
-  "mcpServers": {
-    "garmaple": {
-      "command": "garmaple",
-      "args": ["serve"],
-      "env": {
-        "GARMAPLE_DATA": "C:/Users/你的用户名/Garmaple/data",
-        "GARMAPLE_CACHE": "C:/Users/你的用户名/Garmaple/cache",
-        "GARMAPLE_PRIVACY": "strict"
-      }
-    }
-  }
-}
-```
+-「我的佳明数据覆盖到哪一天？」
+-「最近一个月跑了多少？比较最近四周的训练量和配速。」
+-「睡眠和压力与我第二天的跑步表现有没有统计上的关联？」
+-「这次跑步后半程的心率和配速是否出现明显漂移？」
 
-将 `GARMAPLE_DATA` 和 `GARMAPLE_CACHE` 改成你本机对应文件夹的**完整路径**，不是 zip 文件本身。`GARMAPLE_CACHE` 必须指向运行 `garmaple index` 时使用的同一个缓存目录；按上面的步骤在项目目录运行命令时，就是项目里的 `cache/`。上例是 Windows 路径；macOS 或 Linux 用户填对应的本机路径。不同 AI 客户端的配置位置不同；保存后启用 Garmaple，并按客户端提示重启或确认连接。
+如果 AI 说找不到索引，请让 agent 检查：压缩包是否已放到 Garmaple 能读取的位置、索引是否建立成功，以及 MCP 是否连接到同一份索引。数据更新时，再从 Garmin 导出并让 agent 重新索引。
 
-连接成功后，直接在 AI 对话里用平常说话的方式提问，不需要输入命令或记住工具名称。可以先问「我的佳明数据覆盖到哪一天？」确认连通，再问「最近一个月跑了多少」「比较最近四周的训练量和配速」「睡眠和跑步表现有没有统计上的关联」。AI 会根据问题读取 Garmaple 数据；如果客户端没有显示 Garmaple 工具，先确认 `garmaple doctor` 检查通过，再重启 AI 客户端并检查 MCP 服务是否已启用。
+如果 agent 无法访问本机、运行安装命令或配置当前 AI 客户端的 MCP，它就不能替你完成安装；请让它说明缺少哪项能力，再按它提供的逐步指引操作。
 
 ## 隐私设置
 
@@ -92,13 +72,13 @@ Garmaple 在本机读取导出文件，不登录 Garmin、不向 Garmaple 服务
 
 | 设置 | 返回内容 |
 |---|---|
-| `strict`（默认） | 不返回 GPS 坐标和结构化地点字段；活动只显示日期，活动 ID 使用伪 ID。活动名、装备名等自由文本仍可能包含地点信息 |
+| `strict`（默认） | 不返回 GPS 坐标和地点字段；活动只显示日期，原始活动编号会被替换。活动名、装备名等文字仍可能包含地点信息 |
 | `normal` | 不返回 GPS 坐标；保留精确时间和原始活动 ID |
 | `raw` | 返回原始位置与标识信息；只有确实需要时才开启 |
 
-如果不确定，保留默认的 `strict`。修改设置时，将配置中的 `GARMAPLE_PRIVACY` 改成对应值。
+如果不确定，保留默认的 `strict`。需要调整隐私设置时，让 agent 帮你修改。
 
-**本地文件也要妥善保管：**隐私设置只控制 MCP 返回给 AI 的内容，不会对原始导出包或本地索引进行脱敏。`data/` 和 `cache/` 中仍可能包含 GPS 坐标、地点及原始活动标识等敏感信息；请勿将它们提交到公开仓库或分享给他人。
+**本地文件也要妥善保管：**隐私设置只控制交给 AI 的内容，不会清理原始导出包或本机生成的索引文件。它们仍可能包含 GPS 坐标、地点和活动标识等敏感信息；不要把这些文件发给他人或上传到公开仓库。
 
 ## 使用前了解
 
