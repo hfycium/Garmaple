@@ -64,6 +64,7 @@ Garmin 准备好后会**发邮件给你下载链接**，收到后下载那个 `.
 3. 运行 garmaple index 建立本地索引，再用 garmaple doctor 自检；
 4. 配置本客户端的 MCP 连接（GARMAPLE_DATA 指向那个 data 目录，
    隐私级别用默认的 strict），并确认连通、数据覆盖范围正常。
+5. 帮我分析近期的训练情况
 
 要求：全程在本机处理，不要上传或分享这个 ZIP，不要索要我的 Garmin 账号密码。
 
