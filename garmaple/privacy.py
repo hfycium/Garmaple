@@ -201,13 +201,21 @@ class Privacy:
                 round(act.anaerobic_te, 1) if act.anaerobic_te is not None else None
             ),
             "vo2max": act.vo2max,
-            "cadence_spm": act.cadence_spm,
+            "cadence_spm": (
+                round(act.cadence_spm * 2, 1) if act.cadence_spm is not None else None
+            ),
             "stride_length_cm": (
                 round(act.stride_length_cm, 1) if act.stride_length_cm else None
             ),
             "lap_count": act.lap_count,
             "hr_zones_s": zones,
         }
+
+        if act.cadence_spm is not None:
+            out["cadence_note"] = (
+                "cadence_spm 已由佳明 avgRunCadence 单脚计数乘以 2，"
+                "表示双脚总步数/分钟；仅适用于跑步"
+            )
 
         if self.allows_location:
             out.update(

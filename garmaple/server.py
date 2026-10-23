@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from collections import Counter
 from datetime import date, timedelta
@@ -12,7 +13,7 @@ from typing import Any
 
 from .archive import ArchiveError, discover
 from .config import Config
-from .parser.fit import downsample, sample_summary
+from .parser.fit import downsample, power_duration_curve, sample_summary
 from .parser.sleep import STATUS_OK
 from .parser.metrics import RACE_DISTANCES_KM
 from .parser.records import GROUPS, GearUsage
@@ -39,6 +40,7 @@ from .store import (
     row_to_training,
     row_to_vo2max,
 )
+from .workout_fit import write_workout_fit
 
 INSTRUCTIONS = """\
 本服务读取用户本地的佳明（Garmin）导出数据，不联网、不上传。
@@ -379,6 +381,58 @@ def build_server(cfg: Config) -> Any:
             workout_rpe=stream.workout_rpe,
             workout_feel=stream.workout_feel,
         )
+
+    @mcp.tool()
+    def get_power_curve(activity_id: str) -> dict[str, Any]:
+        """计算单次活动的最佳连续平均功率曲线。
+
+        返回 1 秒到 60 分钟的标准持续时长；每个窗口必须有连续、完整的功率采样，
+        缺口不会插值。设备没记录功率时返回 available:false。
+        """
+        with _store() as store:
+            row = store.find_activity(activity_id)
+            if row is None:
+                return {"error": "未找到该活动", "activity_id": activity_id,
+                        "hint": "请先用 list_activities 获取有效 ID"}
+            act = row_to_activity(row)
+            stream, reason = _activity_stream(store, act)
+        if stream is None:
+            return _no_stream_response(activity_id, reason)
+        curve = power_duration_curve(stream.samples)
+        if not curve:
+            return {
+                "available": False,
+                "activity_id": activity_id,
+                "hint": "这次活动的 FIT 没有功率采样；需要设备或功率计在 record 中写入 power 字段",
+            }
+        return {
+            "available": True,
+            "activity_id": activity_id,
+            "curve": curve,
+            "note": "每个数值是对应时长内连续完整采样的最高平均功率；缺失采样不插值",
+        }
+
+    @mcp.tool()
+    def export_workout_fit(name: str, sport: str, steps_json: str) -> dict[str, Any]:
+        """生成 Garmin FIT 课表，保存到本地 cache/workouts 供手动导入。
+
+        steps_json 是 JSON 数组，每项含 duration_s（秒），可选 name 与 intensity。
+        intensity 可用 active/rest/warmup/cooldown/recovery/interval/other。
+        当前支持时间长度步骤和开放目标。生成后将文件拷入手表 NEW_FILES 目录。
+        """
+        try:
+            steps = json.loads(steps_json)
+            if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
+                raise ValueError("steps_json 必须是 JSON 对象数组")
+            target = write_workout_fit(cfg.cache_dir / "workouts", name, sport, steps)
+        except (ValueError, TypeError, OSError) as exc:
+            raise ToolError(f"无法生成 FIT 课表：{exc}") from exc
+        return {
+            "created": True,
+            "file": f"workouts/{target.name}",
+            "steps": len(steps),
+            "note": "文件位于本机 Garmaple cache/workouts 目录；请手动拷入手表 NEW_FILES 后安全弹出设备",
+        }
 
     @mcp.tool()
     def get_pace_hr_drift(activity_id: str) -> dict[str, Any]:

@@ -57,7 +57,15 @@ def test_daily_summary_tool_is_registered(tmp_path: Path) -> None:
     assert "get_pace_hr_drift" in names
     assert "get_training_load" in names
     assert "get_recovery_correlation" in names
-    assert len(names) == 16
+    assert "get_power_curve" in names
+    assert "export_workout_fit" in names
+    assert len(names) == 18
+
+
+def test_activity_cadence_is_converted_to_both_feet(tmp_path: Path) -> None:
+    out = call(prepared(tmp_path), "get_activity", {"activity_id": pseudo_activity_id(1000)})
+    assert out["cadence_spm"] == 356
+    assert "乘以 2" in out["cadence_note"]
 
 
 def test_hr_zones_distribution(tmp_path: Path) -> None:
@@ -834,6 +842,33 @@ def test_activity_streams_never_exposes_coordinates(tmp_path: Path) -> None:
         flat = json.dumps(out, ensure_ascii=False)
         assert "lat" not in flat and "lon" not in flat
         assert "location" not in flat
+
+
+def test_power_curve_returns_continuous_windows(tmp_path: Path) -> None:
+    cfg = prepared(tmp_path, fits=1, power_w=180)
+    out = call(cfg, "get_power_curve", {"activity_id": pseudo_activity_id(1000)})
+    assert out["available"] is True
+    assert out["curve"][0] == {"duration_s": 1, "best_avg_w": 180}
+    assert len(out["curve"]) == 1  # 合成 FIT 每两秒一个点，没有连续 5 秒窗口
+
+
+def test_power_curve_reports_missing_power(tmp_path: Path) -> None:
+    cfg = prepared(tmp_path, fits=1)
+    out = call(cfg, "get_power_curve", {"activity_id": pseudo_activity_id(1000)})
+    assert out["available"] is False
+    assert "功率采样" in out["hint"]
+
+
+def test_export_workout_fit_writes_under_cache(tmp_path: Path) -> None:
+    cfg = prepared(tmp_path)
+    out = call(cfg, "export_workout_fit", {
+        "name": "节奏跑",
+        "sport": "running",
+        "steps_json": '[{"duration_s":300,"name":"热身","intensity":"warmup"}]',
+    })
+    assert out["created"] is True
+    assert out["file"].startswith("workouts/")
+    assert (cfg.cache_dir / out["file"]).is_file()
 
 
 # ---------------- 配速心率漂移 ----------------

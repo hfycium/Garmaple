@@ -22,6 +22,7 @@ from garmaple.parser.fit import (
     FitSample,
     downsample,
     parse_fit,
+    power_duration_curve,
     read_header,
     read_session_load,
     sample_summary,
@@ -243,6 +244,21 @@ def test_power_summary_omitted_without_power_data():
     # 功率峰值是有效指标（冲刺能力），不像速度会因 GPS 毛刺失真
     assert summary["power_avg_w"] == 202.0
     assert summary["power_max_w"] == 204
+
+
+def test_power_curve_uses_only_contiguous_complete_windows() -> None:
+    samples = [FitSample(offset_s=i, power_w=100 + i) for i in range(10)]
+    curve = power_duration_curve(samples)
+    assert curve[0] == {"duration_s": 1, "best_avg_w": 109}
+    assert curve[1] == {"duration_s": 5, "best_avg_w": 107}
+
+    with_gap = [
+        FitSample(offset_s=0, power_w=100),
+        FitSample(offset_s=1, power_w=110),
+        FitSample(offset_s=3, power_w=120),
+        FitSample(offset_s=4, power_w=130),
+    ]
+    assert power_duration_curve(with_gap) == [{"duration_s": 1, "best_avg_w": 130}]
 
 
 # ---------------- 轻量 session walker ----------------

@@ -446,6 +446,40 @@ def sample_summary(samples: Iterable[FitSample]) -> dict[str, Any]:
     return out
 
 
+POWER_DURATIONS_S = (1, 5, 10, 30, 60, 300, 600, 1200, 1800, 3600)
+
+
+def power_duration_curve(samples: Iterable[FitSample]) -> list[dict[str, int | float]]:
+    """计算标准时长的最佳连续平均功率。
+
+    只在采样时间连续、且每秒功率都存在的窗口上计算，不跨缺口补值。
+    """
+    points = sorted(
+        (s.offset_s, s.power_w) for s in samples if s.power_w is not None
+    )
+    result: list[dict[str, int | float]] = []
+    for duration in POWER_DURATIONS_S:
+        best: float | None = None
+        window: list[int] = []
+        window_sum = 0
+        last_offset: int | None = None
+        for offset, power in points:
+            if last_offset is None or offset != last_offset + 1:
+                window.clear()
+                window_sum = 0
+            window.append(int(power))
+            window_sum += int(power)
+            if len(window) > duration:
+                window_sum -= window.pop(0)
+            if len(window) == duration:
+                average = window_sum / duration
+                best = average if best is None else max(best, average)
+            last_offset = offset
+        if best is not None:
+            result.append({"duration_s": duration, "best_avg_w": round(best, 1)})
+    return result
+
+
 def percentile(values: list[float], fraction: float) -> float:
     """线性插值分位数，避免为了一个数引入 numpy。"""
     if not values:
