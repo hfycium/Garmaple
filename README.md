@@ -55,6 +55,8 @@ garmaple doctor
 Garmaple/
 ├── data/
 │   └── Garmin 导出.zip
+├── cache/                  # garmaple index 自动创建
+│   └── garmaple.sqlite3    # 本地索引
 └── README.md
 ```
 
@@ -72,6 +74,7 @@ Garmaple/
       "args": ["serve"],
       "env": {
         "GARMAPLE_DATA": "C:/Users/你的用户名/Garmaple/data",
+        "GARMAPLE_CACHE": "C:/Users/你的用户名/Garmaple/cache",
         "GARMAPLE_PRIVACY": "strict"
       }
     }
@@ -79,7 +82,7 @@ Garmaple/
 }
 ```
 
-将 `GARMAPLE_DATA` 改成你本机 `data/` 文件夹的**完整路径**，不是 zip 文件本身。上例是 Windows 路径；macOS 或 Linux 用户填对应的本机路径。不同 AI 客户端的配置位置不同；保存后启用 Garmaple，并按客户端提示重启或确认连接。
+将 `GARMAPLE_DATA` 和 `GARMAPLE_CACHE` 改成你本机对应文件夹的**完整路径**，不是 zip 文件本身。`GARMAPLE_CACHE` 必须指向运行 `garmaple index` 时使用的同一个缓存目录；按上面的步骤在项目目录运行命令时，就是项目里的 `cache/`。上例是 Windows 路径；macOS 或 Linux 用户填对应的本机路径。不同 AI 客户端的配置位置不同；保存后启用 Garmaple，并按客户端提示重启或确认连接。
 
 连接成功后，直接在 AI 对话里用平常说话的方式提问，不需要输入命令或记住工具名称。可以先问「我的佳明数据覆盖到哪一天？」确认连通，再问「最近一个月跑了多少」「比较最近四周的训练量和配速」「睡眠和跑步表现有没有统计上的关联」。AI 会根据问题读取 Garmaple 数据；如果客户端没有显示 Garmaple 工具，先确认 `garmaple doctor` 检查通过，再重启 AI 客户端并检查 MCP 服务是否已启用。
 
@@ -89,11 +92,13 @@ Garmaple 在本机读取导出文件，不登录 Garmin、不向 Garmaple 服务
 
 | 设置 | 返回内容 |
 |---|---|
-| `strict`（默认） | 不返回 GPS 坐标和地点；活动只显示日期；活动 ID 使用伪 ID |
+| `strict`（默认） | 不返回 GPS 坐标和结构化地点字段；活动只显示日期，活动 ID 使用伪 ID。活动名、装备名等自由文本仍可能包含地点信息 |
 | `normal` | 不返回 GPS 坐标；保留精确时间和原始活动 ID |
 | `raw` | 返回原始位置与标识信息；只有确实需要时才开启 |
 
 如果不确定，保留默认的 `strict`。修改设置时，将配置中的 `GARMAPLE_PRIVACY` 改成对应值。
+
+**本地文件也要妥善保管：**隐私设置只控制 MCP 返回给 AI 的内容，不会对原始导出包或本地索引进行脱敏。`data/` 和 `cache/` 中仍可能包含 GPS 坐标、地点及原始活动标识等敏感信息；请勿将它们提交到公开仓库或分享给他人。
 
 ## 使用前了解
 
